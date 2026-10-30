@@ -190,22 +190,44 @@ const lintBaseline = (p: CorpusProfile = P()): string => join(p.state, 'lint-bas
 const biliJobsDir = (p: CorpusProfile = P()): string => E.DSH_BILI_JOBS || join(p.state, 'bili-jobs')
 
 // ─────────────────────────────────────────────── 转写线（B站 → 本地 ASR）路径
-// 技能本体：只 import 它的 python 脚本（bilibili_transcribe.py 的 process_video），不重造 ASR。
-const BILI_SKILL_DIR = E.DSH_BILI_SKILL_DIR
-  || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe'
-/** 技能自带的 venv（sensevoice + websockets + ffmpeg 均在其中）。 */
-const PY_BILI = E.DSH_BILI_PY || join(BILI_SKILL_DIR, '.venv', 'Scripts', 'python.exe')
+// P1（2026-10-31）：引擎本体已内嵌到 python/engine/scripts，不再依赖 AionUi 会话里的技能目录。
+// 外部技能目录降级为「可选覆盖」（DSH_BILI_SKILL_DIR / DSH_BILI_ENGINE_DIR），解析顺序与 bridge.py 一致。
+const BILI_SKILL_DIR = E.DSH_BILI_SKILL_DIR || ''
+const BILI_ENGINE_DIR = E.DSH_BILI_ENGINE_DIR
+  || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'engine', 'scripts')
+const BILI_ENGINE_KIND = existsSync(join(BILI_ENGINE_DIR, 'bilibili_transcribe.py')) ? 'builtin' : 'external'
+/** 跑 bridge 的解释器：显式 env → 外部技能 venv → DSH 家目录 venv → 系统 Python（需自带 sherpa-onnx 依赖）。 */
+function resolveBiliPython(): string {
+  const cands = [
+    E.DSH_BILI_PY,
+    BILI_SKILL_DIR ? join(BILI_SKILL_DIR, '.venv', 'Scripts', 'python.exe') : '',
+    join(HOME, '.dsh', 'speech-to-text', 'venv', 'Scripts', 'python.exe'),
+    'C:/Users/Ronnie/AppData/Local/Programs/Python/Python312/python.exe',
+  ]
+  for (const c of cands) if (c && existsSync(c)) return c
+  return E.DSH_BILI_PY || ''
+}
+const PY_BILI = resolveBiliPython()
 /** 桥：拷流程进度到 stdout 的 JSON 行；本插件只认这个契约。 */
 const BRIDGE = E.DSH_BILI_BRIDGE || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'bridge.py')
-/** 转写任务台账（跨重启保留最近 200 条；路径随语料 state 走，见 biliJobsDir()）。 */
 // 本地模型（已备好，插件只做存在性检查，绝不自动下载——SKILL.md 明令）。
 const BILI_MODEL_DIR = E.DSH_BILI_MODEL_DIR
   || 'C:/Users/Ronnie/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx'
 const BILI_VAD_MODEL = E.DSH_BILI_VAD_MODEL
   || 'C:/Users/Ronnie/.dsh/speech-to-text/sensevoice/models/silero/silero_vad.onnx'
-// ffmpeg/ffprobe 不在 PATH：技能靠路径上溯兜底，缺 ffprobe 会静默降级成 300s 预览 → 启动即拦。
-const BILI_FFMPEG = E.DSH_BILI_FFMPEG || join(BILI_SKILL_DIR, '..', '..', '..', 'ffmpeg.exe')
-const BILI_FFPROBE = E.DSH_BILI_FFPROBE || join(BILI_SKILL_DIR, '..', '..', '..', 'ffprobe.exe')
+// ffmpeg/ffprobe：P1 起优先用 ~/.dsh/speech-to-text/ffmpeg（已从会话目录搬出来），
+// 再回退外部技能目录上溯；缺 ffprobe 会被 bridge 直接拦下（静默 300s 预览是历史事故）。
+function firstExisting(paths: Array<string | undefined>): string {
+  for (const p of paths) if (p && existsSync(p)) return p
+  return ''
+}
+const BILI_FFMPEG = E.DSH_BILI_FFMPEG
+  || firstExisting([
+    join(HOME, '.dsh', 'speech-to-text', 'ffmpeg', 'ffmpeg.exe'),
+    BILI_SKILL_DIR ? join(BILI_SKILL_DIR, '..', '..', '..', 'ffmpeg.exe') : '',
+  ])
+  || join(HOME, '.dsh', 'speech-to-text', 'ffmpeg', 'ffmpeg.exe')
+const BILI_FFPROBE = E.DSH_BILI_FFPROBE || BILI_FFMPEG.replace('ffmpeg.exe', 'ffprobe.exe')
 const BILI_MODEL_FILE = join(BILI_MODEL_DIR, 'model.int8.onnx')
 
 const BATCH_SCRIPT = join(SCRATCH, 'smoothing_batch.py')
@@ -1043,7 +1065,9 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         startedAt: j.startedAt, endedAt: j.endedAt,
       })),
       skill: {
-        dir: BILI_SKILL_DIR,
+        kind: BILI_ENGINE_KIND,
+        dir: BILI_ENGINE_DIR,
+        externalDir: BILI_SKILL_DIR || null,
         python: PY_BILI,
         bridge: BRIDGE,
         pythonExists: existsSync(PY_BILI),
@@ -1061,8 +1085,9 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     return new Promise((resolve) => {
       const args = [
         BRIDGE, '--bvid', job.bvid, '--out', P().landing, '--temp', join(P().state, 'bili-temp'),
-        '--lang', 'zh', '--skill-dir', BILI_SKILL_DIR,
+        '--lang', 'zh',
       ]
+      if (BILI_SKILL_DIR) args.push('--skill-dir', BILI_SKILL_DIR)
       if (job.force) args.push('--force')
       job.state = 'running'
       job.stage = 'start'

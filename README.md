@@ -104,14 +104,34 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 
 | 变量 | 默认 |
 | --- | --- |
-| `DSH_BILI_SKILL_DIR` | 技能目录（默认 AionUi 会话下的 bilibili-transcribe） |
-| `DSH_BILI_PY` | 技能 venv 的 python.exe |
+| `DSH_BILI_ENGINE_DIR` | 转写引擎脚本目录（默认内置 `python/engine/scripts`；外部技能目录仅作覆盖） |
+| `DSH_BILI_SKILL_DIR` | **可选**外部技能目录：只在想用外部引擎时设置（默认空 = 用内置引擎） |
+| `DSH_BILI_PY` | 跑 bridge 的 python.exe（默认自动探测：`~/.dsh/speech-to-text/venv` → 外部技能 venv → 系统 Python） |
 | `DSH_BILI_BRIDGE` | `python/bridge.py` |
+| `DSH_BILI_FFMPEG` / `DSH_BILI_FFPROBE` | 默认自动探测 `~/.dsh/speech-to-text/ffmpeg/` |
 | `DSH_BILI_MODEL_DIR` / `SENSEVOICE_MODEL_DIR` | `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx` |
 | `DSH_CORPUS_CONFIG` | 多语料配置文件，默认 `~/.dsh/corpus/corpora.json`（P0 起语料从这里来） |
 | `DSH_CORPUS_ACTIVE` | 首次启动时的默认语料 id（之后以 `~/.dsh/corpus/active-corpus.json` 为准） |
 | `DSH_CORPUS_STATE` / `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_LINT_DIR` | 单语料 env 兜底（不写 corpora.json 时生效；旧名 `DSH_CORPUS_MIRROR` 仍是 ARCHIVE 别名） |
 | `DSH_CORPUS_AUTO` | `false`（不自动跑批） |
+
+## 转写引擎（P1：已内嵌，2026-10-31）
+
+转写引擎（B 站 WBI 下载 + SenseVoice 调用）已复制进 `python/engine/scripts/`，
+`python/bridge.py` 默认用**内置引擎**，不再依赖 AionUi 会话里的技能目录（那个目录随时会被清）。
+解析顺序：`DSH_BILI_ENGINE_DIR`（显式）→ 内置 → 外部技能目录（`--skill-dir` / `DSH_BILI_SKILL_DIR`）。
+
+仍然需要的外部资产（都是模型/二进制，不进 git）：
+
+| 资产 | 默认位置 | 说明 |
+| --- | --- | --- |
+| Python venv | `~/.dsh/speech-to-text/venv` | 需含 `sherpa_onnx`、`numpy`；缺失时回退外部技能 venv |
+| SenseVoice 模型 | `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx` | `model.int8.onnx` + `tokens.txt` |
+| VAD 模型 | `~/.dsh/speech-to-text/sensevoice/models/silero/silero_vad.onnx` | 缺了会分段质量变差 |
+| ffmpeg / ffprobe | `~/.dsh/speech-to-text/ffmpeg/` | 缺 ffprobe 会被 bridge 直接拦下（防静默 300s 预览） |
+
+迁移到另一台机器：插件自带引擎脚本；把上述四样资产按 `DSH_BILI_*` 指过去即可。
+`bili_jobs` 返回的 `skill.kind` 会显示当前用的是 `builtin` 还是 `external`。
 
 ## 第二个语料 / 多语料（实验）
 
@@ -158,6 +178,8 @@ node scripts/smoke-second-corpus.mjs --id demo --transcribe BV112uU6BEQM   # 顺
 5. `bsk`（浏览器 CLI）不在本机，视觉验收用 `~/.dsh/plugins/dsh-super-injector/scripts/render-probe.cjs`
    做「真执行 bundle」的渲染验证：`node render-probe.cjs lib/client.js @dsh-external/dsh-bili-corpus`。
 6. 注入器自重载用 `dev_reload_package`；注入器自身的 entry 没有 `_dispose`，走 `entry.fiber.dispose()`。
+7. **ASR 子进程靠 `SENSEVOICE_FFMPEG` 环境变量找 ffmpeg**：bridge 解析出 ffmpeg 后会写进子进程 env，
+   只给 `bt.FFMPEG` 不够（`sensevoice_asr.py` 是独立 CLI）。2026-10-31 内置引擎实测时踩过。
 
 ## 冒烟
 

@@ -2,3 +2,5 @@ node_modules/
 lib/
 *.tsbuildinfo
 *.tgz
+__pycache__/
+*.pyc

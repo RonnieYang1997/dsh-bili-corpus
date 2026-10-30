@@ -10,10 +10,10 @@
 
 用法（Node 侧唯一约定，参数用 JSON 从 stdin 传也行，这里用 argv 更简单）：
   python bridge.py --bvid BV1xx411c7mD --out "<memory 目录>" --temp "<临时目录>" \
-                   --lang zh [--force] [--skill-dir "<bilibili-transcribe 技能目录>"]
+                   --lang zh [--force] [--skill-dir "<外部技能目录，可选>"]
 
 stdout 协议：每行一个 JSON
-  {"type":"stage","stage":"download|asr|save","msg":"..."}
+  {"type":"stage","stage":"engine|download|asr|save","msg":"..."}
   {"type":"result","ok":true,"bvid":"...","path":"...","duration":123,"textLength":4567,"cached":false}
   {"type":"result","ok":false,"error":"CHARGING|PAYLOAD|ASR|DOWNLOAD|UNKNOWN","message":"..."}
 退出码：0 成功；2 业务失败（stdout 里已有 result）；1 环境错误。
@@ -22,6 +22,7 @@ stdout 协议：每行一个 JSON
 import argparse
 import json
 import os
+import shutil
 import sys
 import traceback
 
@@ -41,19 +42,35 @@ def main():
     ap.add_argument("--skill-dir", default=None, help="bilibili-transcribe 技能根目录")
     args = ap.parse_args()
 
+    # ── 引擎解析（P1：内置引擎优先，外部技能目录只作覆盖/兜底）────────────
+    # 内置：<插件>/python/engine/scripts，随插件分发，不依赖 AionUi 会话临时目录。
+    # 顺序：DSH_BILI_ENGINE_DIR（显式）→ 内置 → --skill-dir/DSH_BILI_SKILL_DIR。
+    here = os.path.dirname(os.path.abspath(__file__))
+    builtin_scripts = os.path.join(here, "engine", "scripts")
+    explicit_engine = os.environ.get("DSH_BILI_ENGINE_DIR", "")
     skill_dir = args.skill_dir or os.environ.get("DSH_BILI_SKILL_DIR") or ""
-    scripts_dir = os.path.join(skill_dir, "scripts")
-    if not os.path.isdir(scripts_dir):
+    external_scripts = os.path.join(skill_dir, "scripts") if skill_dir else ""
+
+    scripts_dir, engine_kind = "", "missing"
+    for cand, kind in ((explicit_engine, "external"), (builtin_scripts, "builtin"), (external_scripts, "external")):
+        if cand and os.path.isfile(os.path.join(cand, "bilibili_transcribe.py")):
+            scripts_dir, engine_kind = cand, kind
+            break
+    if not scripts_dir:
         emit({"type": "result", "ok": False, "error": "ENV",
-              "message": "找不到技能 scripts 目录：%s（用 --skill-dir 或 DSH_BILI_SKILL_DIR 指定）" % scripts_dir})
+              "message": "找不到转写引擎：内置 %s 不存在，也没提供 --skill-dir / DSH_BILI_ENGINE_DIR" % builtin_scripts})
         return 1
+
+    # 内置引擎不带 venv：识别子进程用哪个解释器由这里显式指定（缺省 = 当前解释器）。
+    os.environ.setdefault("SENSEVOICE_PYTHON", sys.executable)
+    emit({"type": "stage", "stage": "engine", "msg": "引擎：%s（%s）" % (engine_kind, scripts_dir)})
     sys.path.insert(0, scripts_dir)
 
     try:
         import bilibili_transcribe as bt  # noqa: E402
     except Exception as e:  # 依赖缺失（venv 不在、ffmpeg 不在）时给出可诊断的信息
         emit({"type": "result", "ok": False, "error": "ENV",
-              "message": "import bilibili_transcribe 失败：%s" % e})
+              "message": "import bilibili_transcribe 失败（%s）：%s" % (scripts_dir, e)})
         traceback.print_exc()
         return 1
 
@@ -67,17 +84,30 @@ def main():
             emit({"type": "result", "ok": False, "error": "ENV",
                   "message": "SenseVoice 模型缺失：%s（不要自动下载，按 SKILL.md 用 fetch_sensevoice_model.py）" % ", ".join(missing)})
             return 1
-    ffmpeg = os.environ.get("SENSEVOICE_FFMPEG", "")
-    if ffmpeg:
-        if not os.path.isfile(ffmpeg):
-            emit({"type": "result", "ok": False, "error": "ENV", "message": "ffmpeg 不存在：%s" % ffmpeg})
-            return 1
-        bt.FFMPEG = ffmpeg
-        ffprobe = ffmpeg.replace("ffmpeg.exe", "ffprobe.exe")
-        if not os.path.isfile(ffprobe):
-            emit({"type": "result", "ok": False, "error": "ENV",
-                  "message": "ffprobe 不存在：%s（缺它会让下载静默降级成 300s 预览）" % ffprobe})
-            return 1
+    # ffmpeg 解析顺序：env（插件注入）→ ~/.dsh/speech-to-text/ffmpeg（本机已备）→ 插件 engine/bin → PATH。
+    # 不再相对「技能目录」上溯——那个会话目录随时会被清掉。
+    def resolve_ffmpeg():
+        home = os.path.expanduser("~")
+        for c in (os.environ.get("SENSEVOICE_FFMPEG", ""),
+                  os.environ.get("DSH_BILI_FFMPEG", ""),
+                  os.path.join(home, ".dsh", "speech-to-text", "ffmpeg", "ffmpeg.exe"),
+                  os.path.join(here, "engine", "bin", "ffmpeg.exe")):
+            if c and os.path.isfile(c):
+                return c
+        return shutil.which("ffmpeg") or ""
+
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        emit({"type": "result", "ok": False, "error": "ENV",
+              "message": "找不到 ffmpeg（放 ~/.dsh/speech-to-text/ffmpeg/ffmpeg.exe 或设 DSH_BILI_FFMPEG）"})
+        return 1
+    bt.FFMPEG = ffmpeg
+    os.environ["SENSEVOICE_FFMPEG"] = ffmpeg  # ASR 子进程（sensevoice_asr.py）也靠这个找 ffmpeg
+    ffprobe = ffmpeg.replace("ffmpeg.exe", "ffprobe.exe")
+    if not os.path.isfile(ffprobe) and not shutil.which("ffprobe"):
+        emit({"type": "result", "ok": False, "error": "ENV",
+              "message": "ffprobe 不存在：%s（缺它会让下载静默降级成 300s 预览）" % ffprobe})
+        return 1
 
     # 给三个阶段函数套进度上报（原样透传参数/返回值）
     def wrap(name, stage, label):
@@ -134,6 +164,7 @@ def main():
             "duration": result.get("duration", 0),
             "textLength": body,
             "cached": bool(result.get("cached")),
+            "engine": engine_kind,
         }
         emit(payload)
         return 0
