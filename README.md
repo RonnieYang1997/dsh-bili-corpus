@@ -48,7 +48,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 旧的 `dsh-corpus-cockpit` 已卸载：本插件用同名 `corpus_*` 工具接管，状态/台账路径不变，
 因此 180 批历史与门禁状态都继承下来。
 
-## 工具（8 个）
+## 工具（9 个）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -108,6 +108,37 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `DSH_CORPUS_STATE` / `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_LEGACY` / `DSH_CORPUS_LINT_DIR` | 见 `src/index.ts` 顶部常量（旧名 `DSH_CORPUS_MIRROR` 仍作为 ARCHIVE 的别名） |
 | `DSH_CORPUS_AUTO` | `false`（不自动跑批） |
 
+## 第二个语料 / 多语料（实验）
+
+路径常量在 `src/index.ts` 加载时从 `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_STATE`
+求值，所以**现在换语料 = 换 env 起一个独立的插件进程**（不是面板开关；面板里的切换属于
+[`docs/generalization-plan.md`](docs/generalization-plan.md) 的 P0）。
+
+自带冒烟脚本（2026-10-30 用 `demo` 语料实测通过）：
+
+```bash
+node scripts/smoke-second-corpus.mjs --id demo --init      # 建一个 2 篇演示稿的最小语料
+node scripts/smoke-second-corpus.mjs --id demo             # 只读检查：status / hydrate / 门禁
+node scripts/smoke-second-corpus.mjs --id demo --transcribe BV112uU6BEQM   # 顺带真转写并验归档
+```
+
+当前位置（可 `--landing/--archive/--state` 覆盖）：
+
+| 角色 | demo 默认 |
+| --- | --- |
+| 落点 | `~/.dsh/corpus/demo/memory` |
+| 存档 | `~/Documents/GitHub/demo-corpus/memory` |
+| 状态 | `~/.dsh/corpus/demo/_smoothing_state` |
+
+**已解耦、在第二个语料上验证过的**：转写（含冷跑）、自动归档 + 两处 `MEMORY.md` 索引、
+`corpus_status` 两库计数、`corpus_hydrate`、`corpus_mirror_sync`、`corpus_gates`（每语料独立
+`lint-baseline-archive.json`）、暂停/恢复。
+
+**仍绑 dufuzhixin 的是清洗引擎（P2 才解）**：`_scratch/corpus_paths.py` 把
+`MAIN/LEGACY_MAIN/MIRROR/STATE` 写成 dufuzhixin 常量；`apply_smoothing.py` / `punct_apply.py`
+各自把 `MIR` 写死；`corpus_lint.py` 的 `assert_corpus_root(min_transcripts=1000)` 会拒绝小语料。
+所以在 demo 上**不要**跑 `corpus_batch` —— 它会读/写 dufuzhixin 的批次与状态。
+
 ## 已知坑（都是踩过的）
 
 1. **宿主进程必须给 python 子进程设 UTF-8**：`PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`，
@@ -128,4 +159,5 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 ```bash
 node ~/.dsh/plugins/dsh-super-injector/scripts/verify-client.cjs lib/client.js @dsh-external/dsh-bili-corpus
 node ~/.dsh/plugins/dsh-super-injector/scripts/render-probe.cjs lib/client.js @dsh-external/dsh-bili-corpus
+node scripts/smoke-second-corpus.mjs --id demo      # 第二个语料的只读冒烟
 ```
