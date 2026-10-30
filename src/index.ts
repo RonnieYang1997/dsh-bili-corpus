@@ -43,23 +43,151 @@ interface PluginContext {
   }
 }
 
-// ─────────────────────────────────────────────────────────── 固定路径（规格 §1）
+// ─────────────────────────────────────────── 语料 profile（P0：配置文件驱动）
 const E = process.env
+const HOME = homedir().replace(/\\/g, '/')
 const WORKSPACE = E.DSH_CORPUS_WORKSPACE || 'C:/Users/Ronnie/Documents/deepseek-harness/default-workspace'
 const SCRATCH = E.DSH_CORPUS_SCRATCH || join(WORKSPACE, '_scratch')
-const STATE = E.DSH_CORPUS_STATE || 'C:/Users/Ronnie/.dsh/corpus/dufuzhixin/_smoothing_state'
-const MAIN = E.DSH_CORPUS_MAIN || 'C:/Users/Ronnie/.dsh/corpus/dufuzhixin/memory'
-/** 产物存档（git 仓，真正的产品、唯一校准源；与 corpus_paths.py 的 MIRROR 同路径）。 */
-const ARCHIVE = E.DSH_CORPUS_ARCHIVE || E.DSH_CORPUS_MIRROR || 'C:/Users/Ronnie/Documents/GitHub/dufuzhixin/memory'
-const PY_SYS = E.DSH_CORPUS_PY || 'C:/Users/Ronnie/AppData/Local/Programs/Python/Python312/python.exe'
-const PY_ASR = E.DSH_CORPUS_ASR_PY
-  || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/.venv/Scripts/python.exe'
-const LINT_DIR = E.DSH_CORPUS_LINT_DIR
-  || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/scripts'
-/** 门禁基线：首次跑门禁时自动生成，之后只判“相对基线的新增回归”。 */
-const LINT_BASELINE = join(STATE, 'lint-baseline.json')
-/** 只对「产物存档」单根跑 lint 的 baseline（与旧的两根 baseline 分开存，互不污染）。 */
-const LINT_BASELINE_ARCHIVE = join(STATE, 'lint-baseline-archive.json')
+
+/** 多语料配置：一份 JSON 描述若干 corpus；改它 + 重载插件即可加语料（env 仍作兼容兜底）。 */
+const CORPORA_FILE = E.DSH_CORPUS_CONFIG || join(HOME, '.dsh', 'corpus', 'corpora.json')
+const ACTIVE_FILE = join(HOME, '.dsh', 'corpus', 'active-corpus.json')
+
+type CorpusProfile = {
+  id: string
+  /** 稿件文件名前缀，例如 `dufu-`（文件名 = `${docPrefix}${bvid}.md`）。 */
+  docPrefix: string
+  /** 每语料自己的索引文件（默认 MEMORY.md；空串 = 不维护索引）。 */
+  indexFile: string
+  landing: string
+  archive: string
+  state: string
+  lintDir: string
+  python: string
+  pythonAsr: string
+}
+
+/** 引擎路径（Python / 技能脚本）与语料数据路径无关，全局一份。 */
+const ENGINE = {
+  python: E.DSH_CORPUS_PY || 'C:/Users/Ronnie/AppData/Local/Programs/Python/Python312/python.exe',
+  pythonAsr: E.DSH_CORPUS_ASR_PY
+    || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/.venv/Scripts/python.exe',
+  lintDir: E.DSH_CORPUS_LINT_DIR
+    || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/scripts',
+}
+
+/** 内置默认语料（env 单语料模式的等价物）。 */
+function envProfile(): CorpusProfile {
+  return {
+    id: 'dufuzhixin',
+    docPrefix: 'dufu-',
+    indexFile: 'MEMORY.md',
+    landing: E.DSH_CORPUS_MAIN || join(HOME, '.dsh', 'corpus', 'dufuzhixin', 'memory'),
+    archive: E.DSH_CORPUS_ARCHIVE || E.DSH_CORPUS_MIRROR || 'C:/Users/Ronnie/Documents/GitHub/dufuzhixin/memory',
+    state: E.DSH_CORPUS_STATE || join(HOME, '.dsh', 'corpus', 'dufuzhixin', '_smoothing_state'),
+    lintDir: ENGINE.lintDir,
+    python: ENGINE.python,
+    pythonAsr: ENGINE.pythonAsr,
+  }
+}
+
+let PROFILES: Record<string, CorpusProfile> | null = null
+let ACTIVE_ID = E.DSH_CORPUS_ACTIVE || 'dufuzhixin'
+
+function readJsonFile<T>(file: string, fallback: T): T {
+  try {
+    return existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as T) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+/** 从 corpora.json + env 解析全部 profile（缺字段继承内置默认）。 */
+function loadProfiles(): Record<string, CorpusProfile> {
+  const base = envProfile()
+  const cfg = readJsonFile<Record<string, any>>(CORPORA_FILE, {})
+  const out: Record<string, CorpusProfile> = { [base.id]: base }
+  const corpora = (cfg && typeof cfg.corpora === 'object' && cfg.corpora) || {}
+  for (const [id, raw] of Object.entries<any>(corpora)) {
+    if (!id || !raw || typeof raw !== 'object') continue
+    const strs = Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'string' && v))
+    out[id] = { ...base, ...strs, id } as CorpusProfile
+  }
+  PROFILES = out
+  const saved = readJsonFile<{ active?: string }>(ACTIVE_FILE, {})
+  const want = String((cfg && cfg.default) || saved.active || ACTIVE_ID)
+  ACTIVE_ID = out[want] ? want : base.id
+  return out
+}
+
+/** 当前生效的语料。所有数据路径都从这里取，不再有模块级路径常量。 */
+function P(): CorpusProfile {
+  if (!PROFILES) loadProfiles()
+  return (PROFILES as Record<string, CorpusProfile>)[ACTIVE_ID] ?? envProfile()
+}
+
+function profileOf(id?: string | null): CorpusProfile {
+  if (!PROFILES) loadProfiles()
+  const map = PROFILES as Record<string, CorpusProfile>
+  if (id && map[id]) return map[id]
+  return P()
+}
+
+/** 工具/任务执行期间把「当前语料」临时切到 id，结束自动恢复（批次/转写全局单并发，安全）。 */
+function bindCorpus<T>(id: string | undefined | null, fn: () => T): T {
+  if (!id) return fn()
+  const prev = ACTIVE_ID
+  ACTIVE_ID = profileOf(id).id
+  try { return fn() } finally { ACTIVE_ID = prev }
+}
+async function bindCorpusAsync<T>(id: string | undefined | null, fn: () => Promise<T>): Promise<T> {
+  if (!id) return fn()
+  const prev = ACTIVE_ID
+  ACTIVE_ID = profileOf(id).id
+  try { return await fn() } finally { ACTIVE_ID = prev }
+}
+
+/** 切换生效语料（写 active-corpus.json；重载插件后仍是它）。 */
+function switchCorpus(id: string): { ok: boolean; error?: string; active?: string; corpora?: string[] } {
+  if (!PROFILES) loadProfiles()
+  const map = PROFILES as Record<string, CorpusProfile>
+  const ids = Object.keys(map)
+  if (!map[id]) return { ok: false, error: `未知语料：${id}（可用：${ids.join(', ')}）`, corpora: ids }
+  ACTIVE_ID = id
+  try {
+    mkdirSync(dirname(ACTIVE_FILE), { recursive: true })
+    writeFileSync(ACTIVE_FILE, `${JSON.stringify({ active: id, at: new Date().toISOString() }, null, 2)}\n`)
+  } catch { /* 写不进就只在进程内生效 */ }
+  return { ok: true, active: id, corpora: ids }
+}
+
+/** 语料清单（给面板选择器 / HTTP 用）。 */
+function corporaSummary(): Record<string, unknown> {
+  if (!PROFILES) loadProfiles()
+  const map = PROFILES as Record<string, CorpusProfile>
+  return {
+    ok: true,
+    active: ACTIVE_ID,
+    file: CORPORA_FILE,
+    root: join(HOME, '.dsh', 'corpus'),
+    corpora: Object.values(map).map((p) => ({
+      id: p.id, docPrefix: p.docPrefix, indexFile: p.indexFile,
+      landing: p.landing, archive: p.archive, state: p.state,
+    })),
+  }
+}
+
+/** 稿件文件名（按语料前缀，P0 起不再写死 dufu-）。 */
+function docName(id: string, prefix: string = P().docPrefix): string { return `${prefix}${id}.md` }
+function isDocName(file: string, prefix: string = P().docPrefix): boolean {
+  return file.startsWith(prefix) && file.endsWith('.md')
+}
+
+const ledgerPath = (p: CorpusProfile = P()): string => join(p.state, 'ledger.json')
+const pausedFlag = (p: CorpusProfile = P()): string => join(p.state, 'cockpit-paused.flag')
+const cockpitState = (p: CorpusProfile = P()): string => join(p.state, 'cockpit-state.json')
+const lintBaseline = (p: CorpusProfile = P()): string => join(p.state, 'lint-baseline-archive.json')
+const biliJobsDir = (p: CorpusProfile = P()): string => E.DSH_BILI_JOBS || join(p.state, 'bili-jobs')
 
 // ─────────────────────────────────────────────── 转写线（B站 → 本地 ASR）路径
 // 技能本体：只 import 它的 python 脚本（bilibili_transcribe.py 的 process_video），不重造 ASR。
@@ -69,8 +197,7 @@ const BILI_SKILL_DIR = E.DSH_BILI_SKILL_DIR
 const PY_BILI = E.DSH_BILI_PY || join(BILI_SKILL_DIR, '.venv', 'Scripts', 'python.exe')
 /** 桥：拷流程进度到 stdout 的 JSON 行；本插件只认这个契约。 */
 const BRIDGE = E.DSH_BILI_BRIDGE || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'bridge.py')
-/** 转写任务台账（跨重启保留最近 200 条）。 */
-const BILI_JOBS_DIR = E.DSH_BILI_JOBS || join(STATE, 'bili-jobs')
+/** 转写任务台账（跨重启保留最近 200 条；路径随语料 state 走，见 biliJobsDir()）。 */
 // 本地模型（已备好，插件只做存在性检查，绝不自动下载——SKILL.md 明令）。
 const BILI_MODEL_DIR = E.DSH_BILI_MODEL_DIR
   || 'C:/Users/Ronnie/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx'
@@ -81,9 +208,6 @@ const BILI_FFMPEG = E.DSH_BILI_FFMPEG || join(BILI_SKILL_DIR, '..', '..', '..', 
 const BILI_FFPROBE = E.DSH_BILI_FFPROBE || join(BILI_SKILL_DIR, '..', '..', '..', 'ffprobe.exe')
 const BILI_MODEL_FILE = join(BILI_MODEL_DIR, 'model.int8.onnx')
 
-const LEDGER = join(STATE, 'ledger.json')
-const PAUSED_FLAG = join(STATE, 'cockpit-paused.flag')
-const COCKPIT_STATE = join(STATE, 'cockpit-state.json')
 const BATCH_SCRIPT = join(SCRATCH, 'smoothing_batch.py')
 const APPLY_SCRIPT = join(SCRATCH, 'apply_smoothing.py')
 const PUNCT_LOCAL = join(SCRATCH, 'punct_local.py')
@@ -182,6 +306,38 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     } catch { /* 日志失败静默 */ }
   }
 
+  // ── 多语料配置：首次跑自动落一份模板；之后改 corpora.json + 重载插件即可加语料
+  try {
+    if (!existsSync(CORPORA_FILE)) {
+      const template = {
+        default: 'dufuzhixin',
+        corpora: {
+          dufuzhixin: {
+            docPrefix: 'dufu-',
+            indexFile: 'MEMORY.md',
+            landing: join(HOME, '.dsh', 'corpus', 'dufuzhixin', 'memory'),
+            archive: 'C:/Users/Ronnie/Documents/GitHub/dufuzhixin/memory',
+            state: join(HOME, '.dsh', 'corpus', 'dufuzhixin', '_smoothing_state'),
+          },
+          demo: {
+            docPrefix: 'dufu-',
+            indexFile: 'MEMORY.md',
+            landing: join(HOME, '.dsh', 'corpus', 'demo', 'memory'),
+            archive: join(HOME, 'Documents', 'GitHub', 'demo-corpus', 'memory'),
+            state: join(HOME, '.dsh', 'corpus', 'demo', '_smoothing_state'),
+          },
+        },
+      }
+      ensureDir(dirname(CORPORA_FILE))
+      writeFileSync(CORPORA_FILE, `${JSON.stringify(template, null, 2)}\n`)
+      log(`已写入多语料配置模板：${CORPORA_FILE}`)
+    }
+    loadProfiles()
+    log(`语料：active=${ACTIVE_ID} 共 ${Object.keys(PROFILES as Record<string, CorpusProfile>).length} 个（${Object.keys(PROFILES as Record<string, CorpusProfile>).join(', ')}）`)
+  } catch (e) {
+    log(`多语料配置初始化失败（退回内置默认）: ${String(e)}`)
+  }
+
   // ── 进程内状态（互斥锁 + 门禁记忆 + 累计 token）
   let inFlight: { kind: string; batch: number; phase: string; startedAt: string } | null = null
   let lastGate: { ok: boolean; at: string; lintRc: number; lintPass: boolean; selftestPass: boolean } | null = null
@@ -192,7 +348,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   let lastRoute: { provider: string; model: string } | null = null
 
   // 落盘状态：跨热重载/重启保住「门禁失败 → 拒绝开下一批」这条硬规则
-  const persisted = readJson<Record<string, any>>(COCKPIT_STATE, {})
+  const persisted = readJson<Record<string, any>>(cockpitState(), {})
   if (persisted && typeof persisted === 'object') {
     if (persisted.lastGate && typeof persisted.lastGate.ok === 'boolean') lastGate = persisted.lastGate
     if (persisted.lastBatch) lastBatch = persisted.lastBatch
@@ -208,14 +364,14 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   const saveState = (): void => {
     try {
-      writeJson(COCKPIT_STATE, {
+      writeJson(cockpitState(), {
         at: nowIso(), auto: AUTO, paused: isPaused(), gateBlocked,
         lastGate, lastBatch, tokens, cycles,
       })
     } catch { /* 状态落盘失败不致命 */ }
   }
 
-  const isPaused = (): boolean => existsSync(PAUSED_FLAG)
+  const isPaused = (): boolean => existsSync(pausedFlag())
 
   // 捕获主模型路由（waterfall 必须 next() 委托）
   try {
@@ -231,8 +387,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   function countRoot(root: string): { dufu: number; other: string[] } {
     try {
       const all = readdirSync(root)
-      const dufu = all.filter((f) => f.startsWith('dufu-') && f.endsWith('.md'))
-      return { dufu: dufu.length, other: all.filter((f) => !(f.startsWith('dufu-') && f.endsWith('.md'))) }
+      const dufu = all.filter((f) => isDocName(f))
+      return { dufu: dufu.length, other: all.filter((f) => !isDocName(f)) }
     } catch {
       return { dufu: -1, other: [] }
     }
@@ -240,8 +396,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   /** 找稿：新稿落点 → 产物存档（存档是唯一校准源）。 */
   function findDoc(bvid: string): string | null {
-    for (const root of [MAIN, ARCHIVE]) {
-      const p = join(root, `dufu-${bvid}.md`)
+    for (const root of [P().landing, P().archive]) {
+      const p = join(root, docName(bvid))
       if (existsSync(p)) return p
     }
     return null
@@ -256,13 +412,20 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   /** MEMORY.md 索引：没有就补一行 `- dufu-<bvid>`（R27 只认这种行形；保持原文件的换行风格）。 */
+  /** 索引行：缺就补一行 `- <prefix><id>`（R27 行形；保持原文件换行风格）。 */
   function ensureIndexLine(root: string, bvid: string): void {
-    const file = join(root, 'MEMORY.md')
+    const indexName = P().indexFile
+    if (!indexName) return // indexFile 为空 = 该语料不维护索引
+    const file = join(root, indexName)
     try {
       const text = existsSync(file) ? readFileSync(file, 'utf8') : ''
-      if (new RegExp(`^- dufu-${bvid}(?:\\.md)?(?=\\s|:|$)`, 'm').test(text)) return
-      const eol = text.includes('\r\n') ? '\r\n' : '\n'
-      const line = `- dufu-${bvid}`
+      const line = `- ${P().docPrefix}${bvid}`
+      const already = text.split(String.fromCharCode(10)).some((l) => {
+        const t = l.trim()
+        return t === line || t === `${line}.md`
+      })
+      if (already) return
+      const eol = text.indexOf(String.fromCharCode(13, 10)) >= 0 ? String.fromCharCode(13) + String.fromCharCode(10) : String.fromCharCode(10)
       const next = text.length === 0 ? `${line}${eol}` : text.endsWith(eol) ? `${text}${line}${eol}` : `${text}${eol}${line}${eol}`
       writeFileSync(file, next, 'utf8')
     } catch (e) {
@@ -276,13 +439,13 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
    * 所以存档里已有同名稿时默认**保留**原样，只有显式 overwrite 才覆盖。
    */
   function archiveDoc(bvid: string, srcPath?: string, opts: { overwrite?: boolean } = {}): { archived: boolean; kept: boolean } {
-    const src = srcPath || join(MAIN, `dufu-${bvid}.md`)
-    const dst = join(ARCHIVE, `dufu-${bvid}.md`)
+    const src = srcPath || join(P().landing, docName(bvid))
+    const dst = join(P().archive, docName(bvid))
     let archived = false
     let kept = false
     try {
       if (existsSync(src)) {
-        ensureDir(ARCHIVE)
+        ensureDir(P().archive)
         if (!existsSync(dst)) {
           copyFileSync(src, dst)
           archived = true
@@ -299,8 +462,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     } catch (e) {
       log(`归档失败 ${bvid}: ${String(e).slice(0, 200)}`)
     }
-    ensureIndexLine(MAIN, bvid)
-    ensureIndexLine(ARCHIVE, bvid)
+    ensureIndexLine(P().landing, bvid)
+    ensureIndexLine(P().archive, bvid)
     return { archived, kept }
   }
 
@@ -313,15 +476,15 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     let copied = 0
     const missing: string[] = []
     for (const bvid of bvids) {
-      const dst = join(MAIN, `dufu-${bvid}.md`)
+      const dst = join(P().landing, docName(bvid))
       if (existsSync(dst)) continue
-      const src = join(ARCHIVE, `dufu-${bvid}.md`)
+      const src = join(P().archive, docName(bvid))
       if (!existsSync(src)) {
         missing.push(bvid)
         continue
       }
       try {
-        ensureDir(MAIN)
+        ensureDir(P().landing)
         copyFileSync(src, dst)
         copied += 1
       } catch (e) {
@@ -338,14 +501,14 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
    * 本来就带标点的稿子永远不会入队 → 用「未入队」区分「没做」和「不用做」。
    */
   function punctQueueStats(): { queued: number; undone: number } {
-    const led = readJson<Record<string, any>>(LEDGER, {})
+    const led = readJson<Record<string, any>>(ledgerPath(), {})
     const punct = (led.punct as Record<string, any>) || {}
     const seen = new Set<string>()
     let undone = 0
     try {
-      for (const f of readdirSync(STATE)) {
+      for (const f of readdirSync(P().state)) {
         if (!/^punct-queue-batch-\d+\.json$/.test(f)) continue
-        const q = readJson<Array<{ bvid: string }>>(join(STATE, f), [])
+        const q = readJson<Array<{ bvid: string }>>(join(P().state, f), [])
         for (const x of q) {
           const b = String(x?.bvid ?? '')
           if (!b || seen.has(b)) continue
@@ -353,12 +516,12 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
           if (String(punct[b]?.status) !== 'done') undone += 1
         }
       }
-    } catch { /* STATE 读不到就按 0 算 */ }
+    } catch { /* P().state 读不到就按 0 算 */ }
     return { queued: seen.size, undone }
   }
 
   function ledgerSummary(): Record<string, unknown> {
-    const led = readJson<Record<string, any>>(LEDGER, {})
+    const led = readJson<Record<string, any>>(ledgerPath(), {})
     const batches = (led.batches as Record<string, any>) || {}
     const docs = (led.docs as Record<string, any>) || {}
     const punct = (led.punct as Record<string, any>) || {}
@@ -370,7 +533,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const lastId = ids.length ? ids[ids.length - 1] : null
     const last = lastId === null ? null : batches[String(lastId)]
     return {
-      ledgerPath: LEDGER,
+      ledgerPath: ledgerPath(),
       batches: ids.length,
       batchIds: ids,
       lastBatchId: lastId,
@@ -398,16 +561,16 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     // 正确口径：baseline 记录“已知状态”，门禁只对“相对 baseline 的新增回归”红。
     // 判的是「产物存档」（GitHub 的 dufuzhixin/memory，真正的产品），单根跑；
     // 判的是唯一校准源（存档）；新稿落点只是临时落脚，不单独进门禁。
-    const baselineArgs = ['--root', ARCHIVE, '--baseline', LINT_BASELINE_ARCHIVE]
-    if (!existsSync(LINT_BASELINE_ARCHIVE)) {
-      const seed = run(PY_SYS, ['corpus_lint.py', '--update-baseline', ...baselineArgs], { cwd: LINT_DIR, timeoutMs: 900000 })
-      log(`lint baseline 初始化 rc=${seed.rc} -> ${LINT_BASELINE_ARCHIVE}`)
+    const baselineArgs = ['--root', P().archive, '--baseline', lintBaseline()]
+    if (!existsSync(lintBaseline())) {
+      const seed = run(P().python, ['corpus_lint.py', '--update-baseline', ...baselineArgs], { cwd: P().lintDir, timeoutMs: 900000 })
+      log(`lint baseline 初始化 rc=${seed.rc} -> ${lintBaseline()}`)
     }
-    const lint = run(PY_SYS, ['corpus_lint.py', ...baselineArgs], { cwd: LINT_DIR, timeoutMs: 900000 })
+    const lint = run(P().python, ['corpus_lint.py', ...baselineArgs], { cwd: P().lintDir, timeoutMs: 900000 })
     const lintPass = lint.rc === 0
       && /RESULT:\s*PASS/.test(lint.out)
       && /NEW REGRESSIONS:\s*none/.test(lint.out)
-    const st = run(PY_SYS, ['corpus_lint_selftest.py'], { cwd: LINT_DIR, timeoutMs: 300000 })
+    const st = run(P().python, ['corpus_lint_selftest.py'], { cwd: P().lintDir, timeoutMs: 300000 })
     const selftestPass = /SELFTEST PASS/.test(st.out)
     const ok = lintPass && selftestPass
     lastGate = { ok, at: nowIso(), lintRc: lint.rc, lintPass, selftestPass }
@@ -416,7 +579,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     log(`gates ok=${ok} lintRc=${lint.rc} lintPass=${lintPass} selftestPass=${selftestPass}`)
     return {
       at: nowIso(),
-      cwd: LINT_DIR,
+      cwd: P().lintDir,
       pass: ok,
       lint: {
         rc: lint.rc, pass: lintPass, ms: lint.ms,
@@ -619,7 +782,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   // ─────────────────────────────────────────────────────── 错字通道（error）
   async function runErrorBatch(opts: { size: number; batch?: number; dryRun: boolean }): Promise<Record<string, unknown>> {
-    const state = readJson<Record<string, any>>(LEDGER, {})
+    const state = readJson<Record<string, any>>(ledgerPath(), {})
     const batches = (state.batches as Record<string, any>) || {}
     let maxN = 0
     for (const k of Object.keys(batches)) {
@@ -627,24 +790,24 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       if (Number.isFinite(n) && n > maxN) maxN = n
     }
     try {
-      for (const f of readdirSync(STATE)) {
+      for (const f of readdirSync(P().state)) {
         const m = f.match(/^queue-batch-(\d+)\.json$/)
         if (m) maxN = Math.max(maxN, Number(m[1]))
       }
-    } catch { /* STATE 不可读 */ }
+    } catch { /* P().state 不可读 */ }
     const batchNo = Number.isFinite(opts.batch as number) ? Number(opts.batch) : maxN + 1
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'queue', startedAt: nowIso() }
-    const q = run(PY_SYS, [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)], { cwd: SCRATCH, timeoutMs: 300000 })
+    const q = run(P().python, [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)], { cwd: SCRATCH, timeoutMs: 300000 })
     if (q.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'queue', error: `queue rc=${q.rc}`, tail: tail(q.out) }
     }
-    const qf = join(STATE, `queue-batch-${batchNo}.json`)
+    const qf = join(P().state, `queue-batch-${batchNo}.json`)
     const queue = readJson<Array<{ bvid: string }>>(qf, [])
     // 旧主库已退役：清洗脚本按「落点 + 存档」两副本工作，缺的从存档补进落点。
     const hyd = hydrateDocs(queue.map((x) => String(x.bvid)))
     if (hyd.copied > 0) log(`批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
-    const snap = run(PY_SYS, [BATCH_SCRIPT, 'snapshot', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 600000 })
+    const snap = run(P().python, [BATCH_SCRIPT, 'snapshot', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 600000 })
     if (snap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'snapshot', error: `snapshot rc=${snap.rc}`, tail: tail(snap.out) }
     }
@@ -662,7 +825,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'verify', startedAt: nowIso() }
-    const ver = run(PY_SYS, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 900000 })
+    const ver = run(P().python, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 900000 })
     if (ver.rc !== 0) {
       return {
         ok: false, batch: batchNo, kind: 'error', phase: 'verify', status: 'FAILED',
@@ -673,21 +836,21 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const patchDir = join(SCRATCH, '_patches', `batch-${batchNo}`)
-    const reportFile = join(STATE, `report-batch-${batchNo}.json`)
+    const reportFile = join(P().state, `report-batch-${batchNo}.json`)
     const applyArgs = [
       APPLY_SCRIPT, '--dir', patchDir,
-      '--snap', join(STATE, `snap-batch-${batchNo}.json`),
+      '--snap', join(P().state, `snap-batch-${batchNo}.json`),
       '--report', reportFile,
       '--drop-bad', '--guard',
     ]
     if (opts.dryRun) applyArgs.push('--dry-run')
-    const ap = run(PY_SYS, applyArgs, { cwd: SCRATCH, timeoutMs: 900000 })
+    const ap = run(P().python, applyArgs, { cwd: SCRATCH, timeoutMs: 900000 })
     if (ap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'apply', status: 'FAILED', error: `apply rc=${ap.rc}`, tail: tail(ap.out) }
     }
     const report = readJson<Record<string, any>>(reportFile, {})
     if (!opts.dryRun) {
-      const rec = run(PY_SYS, [BATCH_SCRIPT, 'record', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 300000 })
+      const rec = run(P().python, [BATCH_SCRIPT, 'record', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 300000 })
       if (rec.rc !== 0) {
         return { ok: false, batch: batchNo, kind: 'error', phase: 'record', status: 'FAILED', error: `record rc=${rec.rc}`, tail: tail(rec.out) }
       }
@@ -726,18 +889,18 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   // ─────────────────────────────────────────────────────── 标点通道（punct）
   function pickPunctBatch(): number | null {
-    const led = readJson<Record<string, any>>(LEDGER, {})
+    const led = readJson<Record<string, any>>(ledgerPath(), {})
     const punct = (led.punct as Record<string, any>) || {}
     const waves: number[] = []
     try {
-      for (const f of readdirSync(STATE)) {
+      for (const f of readdirSync(P().state)) {
         const m = f.match(/^punct-queue-batch-(\d+)\.json$/)
         if (m) waves.push(Number(m[1]))
       }
     } catch { /* ignore */ }
     waves.sort((a, b) => a - b)
     for (const n of waves) {
-      const q = readJson<Array<{ bvid: string }>>(join(STATE, `punct-queue-batch-${n}.json`), [])
+      const q = readJson<Array<{ bvid: string }>>(join(P().state, `punct-queue-batch-${n}.json`), [])
       const undone = q.filter((x) => String(punct[String(x.bvid)]?.status) !== 'done')
       if (undone.length > 0) return n
     }
@@ -747,15 +910,15 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   async function runPunctBatch(opts: { batch?: number; dryRun: boolean }): Promise<Record<string, unknown>> {
     const batchNo = Number.isFinite(opts.batch as number) ? Number(opts.batch) : pickPunctBatch()
     if (batchNo === null) {
-      return { ok: false, kind: 'punct', error: '找不到可跑的点标波（STATE 下没有 punct-queue-batch-N.json）' }
+      return { ok: false, kind: 'punct', error: '找不到可跑的点标波（P().state 下没有 punct-queue-batch-N.json）' }
     }
-    const qf = join(STATE, `punct-queue-batch-${batchNo}.json`)
+    const qf = join(P().state, `punct-queue-batch-${batchNo}.json`)
     const queue = readJson<Array<{ bvid: string }>>(qf, [])
     // 同上：标点脚本也按两副本工作，先把存档里的稿补进落点。
     const hyd = hydrateDocs(queue.map((x) => String(x.bvid)))
     if (hyd.copied > 0) log(`punct 批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
     inFlight = { kind: 'punct', batch: batchNo, phase: 'local-model', startedAt: nowIso() }
-    const local = run(PY_ASR, [PUNCT_LOCAL, '--batch', String(batchNo)], {
+    const local = run(P().pythonAsr, [PUNCT_LOCAL, '--batch', String(batchNo)], {
       cwd: SCRATCH,
       timeoutMs: Number(E.DSH_CORPUS_PUNCT_TIMEOUT_MS || 4 * 3600 * 1000),
     })
@@ -765,11 +928,11 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     inFlight = { kind: 'punct', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const applyArgs = [PUNCT_APPLY, '--batch', String(batchNo)]
     if (opts.dryRun) applyArgs.push('--dry-run')
-    const ap = run(PY_SYS, applyArgs, { cwd: SCRATCH, timeoutMs: 1800000 })
+    const ap = run(P().python, applyArgs, { cwd: SCRATCH, timeoutMs: 1800000 })
     if (ap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'punct', phase: 'apply', status: 'FAILED', error: `punct_apply rc=${ap.rc}`, tail: tail(ap.out) }
     }
-    const report = readJson<Array<Record<string, any>>>(join(STATE, `report-punct-${batchNo}.json`), [])
+    const report = readJson<Array<Record<string, any>>>(join(P().state, `report-punct-${batchNo}.json`), [])
     const landed = report.filter((r) => r && r.ok).length
     const rejected = report.filter((r) => r && !r.ok).length
     inFlight = { kind: 'punct', batch: batchNo, phase: 'gates', startedAt: nowIso() }
@@ -797,7 +960,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   /** 批次互斥 + 门禁闸门 + 暂停闸门。 */
-  async function runBatch(kind: string, opts: { size?: number; batch?: number; dryRun?: boolean }): Promise<Record<string, unknown>> {
+  async function runBatch(kind: string, opts: { size?: number; batch?: number; dryRun?: boolean; corpus?: string }): Promise<Record<string, unknown>> {
     if (inFlight) return { ok: false, error: 'BUSY', detail: inFlight, message: '同一时刻只允许一个批次在跑' }
     if (isPaused()) return { ok: false, error: 'PAUSED', message: '驾驶舱已暂停（corpus_paused.flag 存在）——先 corpus_resume' }
     if (gateBlocked) {
@@ -807,6 +970,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         lastGate,
       }
     }
+    const prevActive = ACTIVE_ID
+    if (opts.corpus) ACTIVE_ID = profileOf(opts.corpus).id
     try {
       if (kind === 'punct') return await runPunctBatch({ batch: opts.batch, dryRun: Boolean(opts.dryRun) })
       return await runErrorBatch({ size: Number(opts.size) || 24, batch: opts.batch, dryRun: Boolean(opts.dryRun) })
@@ -815,6 +980,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       return { ok: false, error: 'EXCEPTION', message: String(e), status: 'FAILED' }
     } finally {
       inFlight = null
+      ACTIVE_ID = prevActive
       saveState()
     }
   }
@@ -834,12 +1000,14 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     textLength: number | null
     cached: boolean
     force: boolean
+    /** 入队时绑定的语料（执行期间按它切 profile，避免中途切换语料串库）。 */
+    corpus?: string
     createdAt: string
     startedAt: string | null
     endedAt: string | null
   }
 
-  const JOBS_FILE = join(BILI_JOBS_DIR, 'jobs.json')
+  const JOBS_FILE = join(biliJobsDir(), 'jobs.json')
   let jobs: BiliJob[] = readJson<BiliJob[]>(JOBS_FILE, [])
   if (!Array.isArray(jobs)) jobs = []
   let biliBusy: BiliJob | null = null
@@ -848,7 +1016,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   const saveJobs = (): void => {
     try {
-      ensureDir(BILI_JOBS_DIR)
+      ensureDir(biliJobsDir())
       writeJson(JOBS_FILE, jobs.slice(-BILI_MAX_JOBS))
     } catch { /* 台账落盘失败不致命 */ }
   }
@@ -867,8 +1035,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     return {
       total: jobs.length, queued, running, done, failed,
       busy: biliBusy ? { id: biliBusy.id, bvid: biliBusy.bvid, stage: biliBusy.stage } : null,
-      cachedFiles: countRoot(ARCHIVE).dufu,
-      landingFiles: countRoot(MAIN).dufu,
+      cachedFiles: countRoot(P().archive).dufu,
+      landingFiles: countRoot(P().landing).dufu,
       recent: jobs.slice(-8).reverse().map((j) => ({
         id: j.id, bvid: j.bvid, state: j.state, stage: j.stage,
         message: j.message, duration: j.duration, textLength: j.textLength, cached: j.cached,
@@ -892,7 +1060,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   function runBridge(job: BiliJob): Promise<void> {
     return new Promise((resolve) => {
       const args = [
-        BRIDGE, '--bvid', job.bvid, '--out', MAIN, '--temp', join(STATE, 'bili-temp'),
+        BRIDGE, '--bvid', job.bvid, '--out', P().landing, '--temp', join(P().state, 'bili-temp'),
         '--lang', 'zh', '--skill-dir', BILI_SKILL_DIR,
       ]
       if (job.force) args.push('--force')
@@ -925,7 +1093,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
           const len = docChars(hit)
           const arch = archiveDoc(job.bvid, hit)
           finish({
-            state: 'done', stage: 'done', path: join(ARCHIVE, `dufu-${job.bvid}.md`),
+            state: 'done', stage: 'done', path: join(P().archive, docName(job.bvid)),
             textLength: len, cached: true,
             message: `命中缓存（${basename(dirname(hit))}）${arch.archived ? ' · 已补归档' : arch.kept ? ' · 存档已有稿（保留）' : ''}`,
           })
@@ -939,7 +1107,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       let child: ReturnType<typeof spawn>
       try {
         child = spawn(PY_BILI, args, {
-          cwd: STATE,
+          cwd: P().state,
           windowsHide: true,
           env: {
             ...process.env,
@@ -971,9 +1139,9 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
               job.stage = String(msg.stage || job.stage)
             } else if (msg.type === 'result') {
               if (msg.ok === true) {
-                // 落点在 MAIN（临时落脚）；真正的产物要归档进 git 仓 + 补索引。
+                // 落点在 P().landing（临时落脚）；真正的产物要归档进 git 仓 + 补索引。
                 const arch = msg.cached === true ? { archived: false, kept: false } : archiveDoc(job.bvid)
-                const productPath = join(ARCHIVE, `dufu-${job.bvid}.md`)
+                const productPath = join(P().archive, docName(job.bvid))
                 finish({
                   state: 'done', stage: 'done',
                   path: existsSync(productPath) ? productPath : (msg.path ? String(msg.path) : null),
@@ -1005,17 +1173,17 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     })
   }
 
-  /** 队列泵：空闲时取下一条 queued 串行执行。 */
+  /** 队列泵：空闲时取下一条 queued 串行执行（按任务入队时的语料绑定，防串库）。 */
   async function drainBiliQueue(): Promise<void> {
     while (!biliBusy) {
       const next = jobs.find((j) => j.state === 'queued')
       if (!next) return
       biliBusy = next
-      await runBridge(next)
+      await bindCorpusAsync(next.corpus, () => runBridge(next))
     }
   }
 
-  function enqueueBili(input: string, force: boolean): { ok: true; job: BiliJob } | { ok: false; error: string } {
+  function enqueueBili(input: string, force: boolean, corpus?: string): { ok: true; job: BiliJob } | { ok: false; error: string } {
     const bvid = extractBvid(input)
     if (!bvid) return { ok: false, error: `无法从输入里认出 BVID：${String(input).slice(0, 80)}` }
     const existing = jobs.find((j) => j.bvid === bvid && (j.state === 'queued' || j.state === 'running'))
@@ -1025,6 +1193,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       bvid, url: /^https?:/.test(input) ? input : null,
       state: 'queued', stage: 'queued', message: '排队中',
       path: null, duration: null, textLength: null, cached: false, force,
+      corpus: profileOf(corpus).id,
       createdAt: nowIso(), startedAt: null, endedAt: null,
     }
     jobs.push(job)
@@ -1040,8 +1209,20 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
   }
 
+  /** 所有工具统一注入可选 `corpus` 参数：执行期临时切换 profile，结束恢复（防串库）。 */
   function register(tool: Record<string, any>, label?: string): void {
     const tag = label || String(tool.name ?? 'tool')
+    const exec = tool.execute
+    if (typeof exec === 'function') {
+      tool.execute = (args: any) => bindCorpusAsync(args && args.corpus ? String(args.corpus) : undefined, () => exec(args))
+    }
+    const params = tool.parameters
+    if (params && params.type === 'object') {
+      params.properties = {
+        ...(params.properties || {}),
+        corpus: { type: 'string', description: '语料 id（缺省 = 当前生效语料；用 corpus_use 切换）' },
+      }
+    }
     try {
       ctx.effect(() => ctx.tools.register(tool), `${SHORT}: ${tag}`)
     } catch (e) {
@@ -1050,22 +1231,46 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   register({
+    name: 'corpus_use',
+    description: '查看/切换当前生效语料。不带 id = 列出全部语料与当前值；带 id = 切换（写 active-corpus.json，重载插件后保持），批次/转写在跑时拒绝。',
+    parameters: {
+      type: 'object',
+      properties: { id: { type: 'string', description: '要切换到的语料 id（缺省 = 只列出）' } },
+    },
+    output: textOutput,
+    async execute(args: Record<string, unknown>) {
+      const id = args?.id ? String(args.id) : ''
+      if (!id) return JSON.stringify(corporaSummary(), null, 2)
+      if (inFlight) return JSON.stringify({ ok: false, error: 'BUSY', message: `批次在跑（${inFlight}），跑完再切语料`, active: ACTIVE_ID }, null, 2)
+      if (biliBusy) return JSON.stringify({ ok: false, error: 'BUSY', message: `转写任务在跑（${biliBusy.id}），跑完再切语料`, active: ACTIVE_ID }, null, 2)
+      const res = switchCorpus(id)
+      if (!res.ok) return JSON.stringify({ ...res, ok: false }, null, 2)
+      jobs = readJson<BiliJob[]>(join(biliJobsDir(), 'jobs.json'), [])
+      if (!Array.isArray(jobs)) jobs = []
+      saveState()
+      log(`切换语料 → ${id}（${P().landing}）`)
+      return JSON.stringify({ ...res, ok: true, landing: P().landing, archive: P().archive, state: P().state }, null, 2)
+    },
+  })
+
+  register({
     name: 'corpus_status',
     description: '语料「文意疏通」驾驶舱只读状态：错字/标点两条通道进度、新稿落点/产物存档两处文件数、最近一批、是否在跑、是否暂停、累计 token、门禁记忆。返回 JSON。',
     parameters: { type: 'object', properties: {} },
     output: textOutput,
     async execute() {
       const led = ledgerSummary()
-      const main = countRoot(MAIN)
-      const archive = countRoot(ARCHIVE)
+      const main = countRoot(P().landing)
+      const archive = countRoot(P().archive)
       const pq = punctQueueStats()
       const status = {
         at: nowIso(),
         ok: true,
+        corpus: P().id,
         ledgerPath: led.ledgerPath,
         roots: {
-          main: { dir: MAIN, role: '新稿落点（临时落脚，DSH 家目录下）', dufuFiles: main.dufu, otherFiles: main.other.length, other: main.other.slice(0, 8) },
-          archive: { dir: ARCHIVE, role: '产物存档（git 仓，真正的产品）', dufuFiles: archive.dufu, otherFiles: archive.other.length, other: archive.other.slice(0, 8) },
+          main: { dir: P().landing, role: '新稿落点（临时落脚，DSH 家目录下）', dufuFiles: main.dufu, otherFiles: main.other.length, other: main.other.slice(0, 8) },
+          archive: { dir: P().archive, role: '产物存档（git 仓，真正的产品）', dufuFiles: archive.dufu, otherFiles: archive.other.length, other: archive.other.slice(0, 8) },
         },
         error: {
           channel: 'error',
@@ -1090,7 +1295,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         },
         running: inFlight,
         paused: isPaused(),
-        pausedFlag: PAUSED_FLAG,
+        pausedFlag: pausedFlag(),
         auto: AUTO,
         autoEnv: 'DSH_CORPUS_AUTO',
         gateBlocked,
@@ -1180,23 +1385,23 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     async execute(args: Record<string, unknown>) {
       const dryRun = args?.dryRun !== false
       const report = {
-        archive: ARCHIVE, landing: MAIN, dryRun,
+        archive: P().archive, landing: P().landing, dryRun,
         copied: [] as string[], updated: [] as string[], extraInArchive: [] as string[], errors: [] as string[],
       }
       // 文件名 → 绝对路径；只认新稿落点（旧主库已退役）。
       const sources = new Map<string, string>()
-      for (const root of [MAIN]) {
+      for (const root of [P().landing]) {
         try {
           for (const f of readdirSync(root)) {
-            if (!f.startsWith('dufu-') || !f.endsWith('.md') || sources.has(f)) continue
+            if (!isDocName(f) || sources.has(f)) continue
             sources.set(f, join(root, f))
           }
         } catch { /* 目录不存在就跳过 */ }
       }
       if (sources.size === 0) return JSON.stringify({ ok: false, error: '新稿落点读不到稿件' }, null, 2)
-      try { ensureDir(ARCHIVE) } catch { /* 已在 */ }
+      try { ensureDir(P().archive) } catch { /* 已在 */ }
       for (const [f, src] of sources) {
-        const dst = join(ARCHIVE, f)
+        const dst = join(P().archive, f)
         try {
           if (!existsSync(dst)) {
             report.copied.push(f)
@@ -1212,8 +1417,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         }
       }
       try {
-        for (const f of readdirSync(ARCHIVE)) {
-          if (f.startsWith('dufu-') && f.endsWith('.md') && !sources.has(f)) report.extraInArchive.push(f)
+        for (const f of readdirSync(P().archive)) {
+          if (isDocName(f) && !sources.has(f)) report.extraInArchive.push(f)
         }
       } catch { /* 存档读不到 */ }
       log(`archive-sync dryRun=${dryRun} copy=${report.copied.length} update=${report.updated.length} extra=${report.extraInArchive.length}`)
@@ -1244,14 +1449,14 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : Number.POSITIVE_INFINITY
       const landing = new Set<string>()
       try {
-        for (const f of readdirSync(MAIN)) {
-          if (f.startsWith('dufu-') && f.endsWith('.md')) landing.add(f)
+        for (const f of readdirSync(P().landing)) {
+          if (isDocName(f)) landing.add(f)
         }
       } catch { /* 落点不存在 = 全缺 */ }
       const missing: string[] = []
       try {
-        for (const f of readdirSync(ARCHIVE)) {
-          if (f.startsWith('dufu-') && f.endsWith('.md') && !landing.has(f)) missing.push(f)
+        for (const f of readdirSync(P().archive)) {
+          if (isDocName(f) && !landing.has(f)) missing.push(f)
         }
       } catch {
         return JSON.stringify({ ok: false, error: '产物存档读不到' }, null, 2)
@@ -1260,10 +1465,10 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       let copied = 0
       const errors: string[] = []
       if (!dryRun) {
-        try { ensureDir(MAIN) } catch { /* 已在 */ }
+        try { ensureDir(P().landing) } catch { /* 已在 */ }
         for (const f of todo) {
           try {
-            copyFileSync(join(ARCHIVE, f), join(MAIN, f))
+            copyFileSync(join(P().archive, f), join(P().landing, f))
             copied += 1
           } catch (e) {
             errors.push(`${f}: ${String(e).slice(0, 120)}`)
@@ -1274,8 +1479,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       return JSON.stringify({
         ok: errors.length === 0,
         dryRun,
-        landing: MAIN,
-        archive: ARCHIVE,
+        landing: P().landing,
+        archive: P().archive,
         landingFiles: landing.size,
         missing: missing.length,
         planned: todo.length,
@@ -1302,10 +1507,10 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     parameters: { type: 'object', properties: { reason: { type: 'string', description: '暂停原因（写进 flag 文件）' } } },
     output: textOutput,
     async execute(args: Record<string, unknown>) {
-      writeJson(PAUSED_FLAG, { at: nowIso(), reason: String(args?.reason ?? '手动暂停'), by: 'corpus_pause' })
+      writeJson(pausedFlag(), { at: nowIso(), reason: String(args?.reason ?? '手动暂停'), by: 'corpus_pause' })
       saveState()
       log('paused')
-      return JSON.stringify({ ok: true, at: nowIso(), paused: true, flag: PAUSED_FLAG, reason: String(args?.reason ?? '手动暂停') }, null, 2)
+      return JSON.stringify({ ok: true, at: nowIso(), paused: true, flag: pausedFlag(), reason: String(args?.reason ?? '手动暂停') }, null, 2)
     },
   })
 
@@ -1317,7 +1522,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     async execute() {
       let removed = false
       try {
-        if (existsSync(PAUSED_FLAG)) { rmSync(PAUSED_FLAG, { force: true }); removed = true }
+        if (existsSync(pausedFlag())) { rmSync(pausedFlag(), { force: true }); removed = true }
       } catch (e) {
         return JSON.stringify({ ok: false, error: String(e) }, null, 2)
       }
@@ -1396,24 +1601,55 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
             res.end(JSON.stringify(body, null, 2))
           }
-          const led = ledgerSummary()
-          const landing = countRoot(MAIN)
-          const archive = countRoot(ARCHIVE)
-              if (url.pathname === '/dsh-bili-corpus/api/status') {
-            json(200, {
-              at: nowIso(), error: { total: archive.dufu, done: led.docsDone, batches: led.batches, lastBatch: led.lastBatch },
-              punct: (() => { const q = punctQueueStats(); return { total: Number(led.punctDone) + q.undone, done: led.punctDone, undone: q.undone, unneeded: Math.max(0, archive.dufu - Number(led.punctDone) - q.undone) } })(),
+          const qCorpus = url.searchParams.get('corpus') || undefined
+          const path = url.pathname
+          const statusBody = (): Record<string, unknown> => {
+            const led = ledgerSummary()
+            const landing = countRoot(P().landing)
+            const archive = countRoot(P().archive)
+            const q = punctQueueStats()
+            return {
+              at: nowIso(), corpus: P().id,
+              error: { total: archive.dufu, done: led.docsDone, batches: led.batches, lastBatch: led.lastBatch },
+              punct: {
+                total: Number(led.punctDone) + q.undone, done: led.punctDone,
+                queued: q.queued, undone: q.undone,
+                unneeded: Math.max(0, archive.dufu - Number(led.punctDone) - q.undone),
+              },
               roots: {
-                main: { dir: MAIN, role: '新稿落点（临时落脚）', dufuFiles: landing.dufu },
-                archive: { dir: ARCHIVE, role: '产物存档（git 仓）', dufuFiles: archive.dufu },
+                main: { dir: P().landing, role: '新稿落点（临时落脚）', dufuFiles: landing.dufu },
+                archive: { dir: P().archive, role: '产物存档（git 仓）', dufuFiles: archive.dufu },
               },
               running: inFlight, paused: isPaused(), gateBlocked, lastGate, lastBatch, tokens, auto: AUTO,
               transcribe: biliSummary(),
+            }
+          }
+          if (path === '/dsh-bili-corpus/api/corpora') { json(200, corporaSummary()); return }
+          if (path === '/dsh-bili-corpus/api/corpus' && String(req.method).toUpperCase() === 'POST') {
+            let body = ''
+            req.on('data', (c: any) => { body = (body + String(c)).slice(0, 4096) })
+            req.on('end', () => {
+              try {
+                const parsed = body ? JSON.parse(body) : {}
+                const id = String(parsed.id ?? parsed.corpus ?? '')
+                if (!id) { json(400, { ok: false, error: '缺少 id' }); return }
+                if (inFlight || biliBusy) { json(409, { ok: false, error: 'BUSY', active: ACTIVE_ID }); return }
+                const r = switchCorpus(id)
+                if (!r.ok) { json(400, r); return }
+                jobs = readJson<BiliJob[]>(join(biliJobsDir(), 'jobs.json'), [])
+                if (!Array.isArray(jobs)) jobs = []
+                saveState()
+                json(200, { ...r, landing: P().landing, archive: P().archive })
+              } catch (e) {
+                json(400, { ok: false, error: `请求体不是 JSON：${String(e)}` })
+              }
             })
             return
           }
-          if (url.pathname === '/dsh-bili-corpus/api/jobs') {
-            json(200, { at: nowIso(), ok: true, ...biliSummary(), jobs: jobs.slice(-50).reverse() })
+          if (path === '/dsh-bili-corpus/api/status') { json(200, bindCorpus(qCorpus, statusBody)); return }
+          if (path === '/dsh-bili-corpus/api/jobs') {
+            const body = bindCorpus(qCorpus, () => ({ at: nowIso(), ok: true, ...biliSummary(), jobs: jobs.slice(-50).reverse() }))
+            json(200, body)
             return
           }
           if (url.pathname === '/dsh-bili-corpus/api/transcribe' && String(req.method).toUpperCase() === 'POST') {
@@ -1422,7 +1658,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             req.on('end', () => {
               try {
                 const parsed = body ? JSON.parse(body) : {}
-                const res2 = enqueueBili(String(parsed.target ?? parsed.bvid ?? parsed.url ?? ''), parsed.force === true)
+                const res2 = enqueueBili(String(parsed.target ?? parsed.bvid ?? parsed.url ?? ''), parsed.force === true, qCorpus)
                 json(res2.ok ? 200 : 400, res2)
               } catch (e) {
                 json(400, { ok: false, error: `请求体不是 JSON：${String(e)}` })
@@ -1430,27 +1666,31 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             })
             return
           }
-          if (url.pathname === '/dsh-bili-corpus/api/pause') {
-            writeJson(PAUSED_FLAG, { at: nowIso(), reason: '面板暂停', by: 'panel' })
-            saveState()
-            json(200, { ok: true, paused: true })
+          if (path === '/dsh-bili-corpus/api/pause') {
+            bindCorpus(qCorpus, () => {
+              writeJson(pausedFlag(), { at: nowIso(), reason: '面板暂停', by: 'panel' })
+              saveState()
+            })
+            json(200, { ok: true, paused: true, corpus: P().id })
             return
           }
-          if (url.pathname === '/dsh-bili-corpus/api/resume') {
-            try { rmSync(PAUSED_FLAG, { force: true }) } catch { /* ignore */ }
-            saveState()
-            json(200, { ok: true, paused: false })
+          if (path === '/dsh-bili-corpus/api/resume') {
+            bindCorpus(qCorpus, () => {
+              try { rmSync(pausedFlag(), { force: true }) } catch { /* ignore */ }
+              saveState()
+            })
+            json(200, { ok: true, paused: false, corpus: P().id })
             return
           }
           json(404, { ok: false, error: 'not found', path: url.pathname })
         },
       }), `${SHORT}: http`)
-      log('host HTTP 端点已挂载：/dsh-bili-corpus/api/{status,jobs,transcribe,pause,resume}')
+      log('host HTTP 端点已挂载：/dsh-bili-corpus/api/{corpora,corpus,status,jobs,transcribe,pause,resume}')
     }
   } catch (e) {
     log(`HTTP 端点挂载失败（面板降级为只读提示）: ${String(e)}`)
   }
 
   ctx.logger?.info?.(`[${name}] 驾驶舱就绪：tools=corpus_status/corpus_gates/corpus_batch/corpus_pause/corpus_resume/corpus_mirror_sync/corpus_hydrate/bili_transcribe/bili_jobs；auto=${AUTO}`)
-  log(`apply 完成：auto=${AUTO} intervalMs=${INTERVAL_MS} state=${STATE}`)
+  log(`apply 完成：auto=${AUTO} intervalMs=${INTERVAL_MS} state=${P().state}`)
 }

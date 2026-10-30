@@ -1,5 +1,7 @@
 # dsh-bili-corpus 泛化改造计划（草案 v1 · 2026-10-30）
 
+> **进度**：P0 已于 2026-10-30 落地（`~/.dsh/corpus/corpora.json` + `corpus_use` + 面板语料 chip + `GET /api/corpora` / `POST /api/corpus` / `GET /api/status?corpus=`）。P1/P2/P3 未动。
+
 > 目标：从「独夫之心专用」变成「任意音频 → 转写稿」+「任意文本语料 → LLM 校对 / 标点恢复 / 门禁」的通用插件。
 > 本文只是计划，不含实现；每个阶段都可独立交付、独立回滚。
 

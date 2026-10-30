@@ -138,6 +138,7 @@ type Transcribe = {
 
 type Status = {
   at?: string
+  corpus?: string
   error?: {
     done?: number
     total?: number
@@ -153,6 +154,12 @@ type Status = {
   auto?: boolean
   tokens?: { input?: number; output?: number; calls?: number }
   transcribe?: Transcribe
+}
+
+type Corpora = {
+  ok?: boolean
+  active?: string
+  corpora?: Array<{ id: string; docPrefix?: string; landing?: string; archive?: string }>
 }
 
 function countOf(v: Count | undefined): string {
@@ -261,7 +268,7 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void }
     h(
       'div',
       { style: { marginTop: 6, color: '#888', fontSize: 11, lineHeight: 1.5 } },
-      '转写为本地 SenseVoice（0 token）：先落临时落点（~/.dsh/corpus），完成后自动归档进 GitHub 的 dufuzhixin/memory 并补 MEMORY.md 索引；同一时刻只跑一个任务。',
+      '转写为本地 SenseVoice（0 token）：先写当前语料的落点，完成后自动归档进它的产物存档并补索引文件；同一时刻只跑一个任务。',
     ),
   )
 }
@@ -269,20 +276,41 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void }
 function CockpitPanel(): ReactElement {
   const [status, setStatus] = useState<Status | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
+  const [corpora, setCorpora] = useState<Array<{ id: string }>>([])
+  const [active, setActive] = useState('')
 
-  const refresh = useCallback(() => {
-    fetch(`${API}/status`, { headers: { accept: 'application/json' } })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((s: Status) => {
-        setStatus(s)
-        setFailure(null)
+  const refresh = useCallback(async (corpus?: string) => {
+    try {
+      const c: Corpora = await fetch(`${API}/corpora`, { headers: { accept: 'application/json' } }).then((r) => r.json())
+      setCorpora(Array.isArray(c?.corpora) ? (c.corpora as Array<{ id: string }>) : [])
+      const want = corpus || active || c?.active || ''
+      if (want) setActive(want)
+      const url = `${API}/status${want ? `?corpus=${encodeURIComponent(want)}` : ''}`
+      const s: Status = await fetch(url, { headers: { accept: 'application/json' } })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      setStatus(s)
+      setFailure(null)
+    } catch (e) {
+      setFailure(String(e))
+    }
+  }, [active])
+
+  const switchTo = useCallback((id: string) => {
+    fetch(`${API}/corpus`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) })
+      .then((r) => r.json())
+      .then((r: { ok?: boolean; error?: string }) => {
+        if (r?.ok === false) setFailure(r.error ?? '切换语料失败')
+        else {
+          setActive(id)
+          void refresh(id)
+        }
       })
       .catch((e: unknown) => setFailure(String(e)))
-  }, [])
+  }, [refresh])
 
   useEffect(() => {
-    refresh()
-    const timer = setInterval(refresh, 15000)
+    void refresh()
+    const timer = setInterval(() => { void refresh() }, 15000)
     return () => clearInterval(timer)
   }, [refresh])
 
@@ -351,7 +379,19 @@ function CockpitPanel(): ReactElement {
   return h(
     'div',
     { style: cardStyle },
-    h('div', { style: titleStyle }, 'B 站转写 · 语料文意疏通'),
+    h('div', { style: titleStyle }, status?.corpus ? `B 站转写 · 语料文意疏通（${status.corpus}）` : 'B 站转写 · 语料文意疏通'),
+    h(
+      'div',
+      { style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', margin: '2px 0 8px' } },
+      h('span', { style: { color: '#777', fontSize: 12 } }, '语料'),
+      ...corpora.map((c) => h('button', {
+        key: c.id,
+        type: 'button',
+        disabled: c.id === active,
+        style: { ...btnStyle, padding: '2px 8px', opacity: c.id === active ? 0.55 : 1 },
+        onClick: () => switchTo(c.id),
+      }, c.id)),
+    ),
     failure
       ? h('div', { style: { color: '#e88' } }, `host 端点不可用（${failure}）。请在会话里用工具 bili_jobs / corpus_status 查看。`)
       : status
@@ -361,7 +401,7 @@ function CockpitPanel(): ReactElement {
     h(
       'div',
       { style: { display: 'flex', gap: 8, marginTop: 10 } },
-      h('button', { type: 'button', style: btnStyle, onClick: refresh }, '刷新'),
+      h('button', { type: 'button', style: btnStyle, onClick: () => { void refresh() } }, '刷新'),
       h(
         'button',
         { type: 'button', style: btnStyle, onClick: () => post('/pause') },

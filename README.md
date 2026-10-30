@@ -48,7 +48,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 旧的 `dsh-corpus-cockpit` 已卸载：本插件用同名 `corpus_*` 工具接管，状态/台账路径不变，
 因此 180 批历史与门禁状态都继承下来。
 
-## 工具（9 个）
+## 工具（10 个）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -60,12 +60,15 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `corpus_pause {reason?}` / `corpus_resume` | 暂停写 `_smoothing_state/cockpit-paused.flag`；恢复只删 flag，**不会**自动开批。 |
 | `corpus_mirror_sync {dryRun?}` | 把落点里的稿补进「产物存档」（内容不同才覆盖、缺的补、存档多出的只报告）。默认 dryRun=true。 |
 | `corpus_hydrate {dryRun?, limit?}` | 反向补齐：把存档里有、落点里没有的稿复制回落点（旧稿要在落点开批前先补齐）。默认 dryRun=true 只报告。 |
+| `corpus_use {id?}` | 不带 id = 列出全部语料与当前生效语料；带 id = 切换（写 `~/.dsh/corpus/active-corpus.json`，重载插件后保持）。批次/转写在跑时拒绝。 |
 
 ## HTTP 端点
 
 前缀 `/dsh-bili-corpus/api`：
 
-- `GET  /status` — 面板数据（清洗状态 + `transcribe` 队列摘要与引擎自检）
+- `GET  /status?corpus=<id>` — 面板数据（清洗状态 + `transcribe` 队列摘要与引擎自检）；缺 `corpus` = 当前生效语料
+- `GET  /corpora` — 语料清单（id/路径/当前生效）
+- `POST /corpus` — `{id}` 切换当前语料（批次/转写在跑时 409）
 - `GET  /jobs` — 转写队列
 - `POST /transcribe` — `{target|bvid|url, force?}` 入队
 - `POST /pause` / `POST /resume` — 清洗闸门
@@ -105,14 +108,16 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `DSH_BILI_PY` | 技能 venv 的 python.exe |
 | `DSH_BILI_BRIDGE` | `python/bridge.py` |
 | `DSH_BILI_MODEL_DIR` / `SENSEVOICE_MODEL_DIR` | `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx` |
-| `DSH_CORPUS_STATE` / `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_LEGACY` / `DSH_CORPUS_LINT_DIR` | 见 `src/index.ts` 顶部常量（旧名 `DSH_CORPUS_MIRROR` 仍作为 ARCHIVE 的别名） |
+| `DSH_CORPUS_CONFIG` | 多语料配置文件，默认 `~/.dsh/corpus/corpora.json`（P0 起语料从这里来） |
+| `DSH_CORPUS_ACTIVE` | 首次启动时的默认语料 id（之后以 `~/.dsh/corpus/active-corpus.json` 为准） |
+| `DSH_CORPUS_STATE` / `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_LINT_DIR` | 单语料 env 兜底（不写 corpora.json 时生效；旧名 `DSH_CORPUS_MIRROR` 仍是 ARCHIVE 别名） |
 | `DSH_CORPUS_AUTO` | `false`（不自动跑批） |
 
 ## 第二个语料 / 多语料（实验）
 
-路径常量在 `src/index.ts` 加载时从 `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_STATE`
-求值，所以**现在换语料 = 换 env 起一个独立的插件进程**（不是面板开关；面板里的切换属于
-[`docs/generalization-plan.md`](docs/generalization-plan.md) 的 P0）。
+**P0 已落地**：语料由 `~/.dsh/corpus/corpora.json` 描述（`id → {docPrefix,indexFile,landing,archive,state}`），
+面板标题下有语料 chip 可直接切换（`corpus_use` / `POST /api/corpus` 同一效果），当前语料记在
+`active-corpus.json`，重载插件后保持。新增语料 = 往 corpora.json 里加一条 + 重载插件。
 
 自带冒烟脚本（2026-10-30 用 `demo` 语料实测通过）：
 
