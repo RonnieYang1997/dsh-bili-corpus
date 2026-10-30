@@ -1419,10 +1419,12 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     output: textOutput,
     async execute(args: Record<string, unknown>) {
       if (args?.clear === true) {
-        const before = jobs.length
-        jobs = jobs.filter((j) => j.state === 'queued' || j.state === 'running')
+        const scoped = jobsOf()
+        const keep = scoped.filter((j) => j.state === 'queued' || j.state === 'running')
+        const keepIds = new Set(keep.map((j) => j.id))
+        jobs = jobs.filter((j) => !scoped.some((s) => s.id === j.id) || keepIds.has(j.id))
         saveJobs()
-        return JSON.stringify({ ok: true, removed: before - jobs.length, left: jobs.length }, null, 2)
+        return JSON.stringify({ ok: true, removed: scoped.length - keep.length, left: keep.length }, null, 2)
       }
       const id = args?.id ? String(args.id) : ''
       if (id) {
@@ -1434,7 +1436,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       return JSON.stringify({
         ok: true,
         ...summary,
-        recent: jobs.slice(-limit).reverse(),
+        recent: jobsOf().slice(-limit).reverse(),
       }, null, 2)
     },
   })
