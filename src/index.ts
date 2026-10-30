@@ -133,18 +133,26 @@ function profileOf(id?: string | null): CorpusProfile {
   return P()
 }
 
+/**
+ * 语料切换（显式 corpus 绑定 / corpus_use / HTTP 切换）后，把「转写队列 + 门禁记忆 + token」
+ * 重新挂到新语料上。由 apply() 内部赋值（它才拿得到 jobs/state 这些闭包变量）。
+ */
+let onCorpusChanged: (() => void) | null = null
+
 /** 工具/任务执行期间把「当前语料」临时切到 id，结束自动恢复（批次/转写全局单并发，安全）。 */
 function bindCorpus<T>(id: string | undefined | null, fn: () => T): T {
   if (!id) return fn()
   const prev = ACTIVE_ID
   ACTIVE_ID = profileOf(id).id
-  try { return fn() } finally { ACTIVE_ID = prev }
+  onCorpusChanged?.()
+  try { return fn() } finally { ACTIVE_ID = prev; onCorpusChanged?.() }
 }
 async function bindCorpusAsync<T>(id: string | undefined | null, fn: () => Promise<T>): Promise<T> {
   if (!id) return fn()
   const prev = ACTIVE_ID
   ACTIVE_ID = profileOf(id).id
-  try { return await fn() } finally { ACTIVE_ID = prev }
+  onCorpusChanged?.()
+  try { return await fn() } finally { ACTIVE_ID = prev; onCorpusChanged?.() }
 }
 
 /** 切换生效语料（写 active-corpus.json；重载插件后仍是它）。 */
@@ -1029,17 +1037,48 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     endedAt: string | null
   }
 
-  const JOBS_FILE = join(biliJobsDir(), 'jobs.json')
-  let jobs: BiliJob[] = readJson<BiliJob[]>(JOBS_FILE, [])
-  if (!Array.isArray(jobs)) jobs = []
+  /**
+   * 任务台账：每个语料自己的 `state/bili-jobs/jobs.json`，内存里按 id 合并成一张全局表。
+   * 以前用「单个全局数组 + 当前语料路径」，切语料时会把 A 的任务写进 B 的目录。
+   */
+  const jobsFileOf = (id: string): string => join(biliJobsDir(profileOf(id)), 'jobs.json')
+  let jobs: BiliJob[] = []
+  const loadAllJobs = (): void => {
+    const merged = new Map<string, BiliJob>()
+    const ids = Object.keys(loadProfiles())
+    for (const id of ids.length ? ids : [profileOf().id]) {
+      const list = readJson<BiliJob[]>(jobsFileOf(id), [])
+      if (!Array.isArray(list)) continue
+      for (const j of list) merged.set(j.id, { ...j, corpus: j.corpus || id })
+    }
+    jobs = Array.from(merged.values()).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+  }
+  loadAllJobs()
+  /** 某语料名下的任务（旧记录没有 corpus 字段，归 dufuzhixin）。 */
+  const jobsOf = (id: string = profileOf().id): BiliJob[] => jobs.filter((j) => (j.corpus || 'dufuzhixin') === id)
   let biliBusy: BiliJob | null = null
   const BILI_TIMEOUT_MS = Number(E.DSH_BILI_TIMEOUT_MS || 4 * 60 * 60 * 1000)
   const BILI_MAX_JOBS = 200
 
-  const saveJobs = (): void => {
+  /** 语料切换后重挂运行时状态（否则面板会显示上一个语料的「完成 N」与门禁记忆）。 */
+  onCorpusChanged = () => {
+    const running = jobs.find((j) => j.state === 'running')
+    biliBusy = running && (running.corpus || 'dufuzhixin') === profileOf().id ? running : (running ? biliBusy : null)
+    const p = readJson<Record<string, any>>(cockpitState(), {})
+    lastGate = p && p.lastGate && typeof p.lastGate.ok === 'boolean' ? p.lastGate : null
+    lastBatch = p && p.lastBatch ? p.lastBatch : null
+    gateBlocked = p ? p.gateBlocked === true : false
+    tokens = p && typeof p.tokens === 'object'
+      ? { input: Number(p.tokens.input) || 0, output: Number(p.tokens.output) || 0, calls: Number(p.tokens.calls) || 0 }
+      : { input: 0, output: 0, calls: 0 }
+  }
+
+  const saveJobs = (corpusId?: string): void => {
     try {
-      ensureDir(biliJobsDir())
-      writeJson(JOBS_FILE, jobs.slice(-BILI_MAX_JOBS))
+      const id = corpusId || (biliBusy?.corpus ?? profileOf().id)
+      const partition = jobsOf(id)
+      ensureDir(biliJobsDir(profileOf(id)))
+      writeJson(jobsFileOf(id), partition.slice(-BILI_MAX_JOBS))
     } catch { /* 台账落盘失败不致命 */ }
   }
   const findJob = (id: string): BiliJob | null => jobs.find((j) => j.id === id) ?? null
@@ -1050,16 +1089,18 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   function biliSummary(): Record<string, unknown> {
-    const queued = jobs.filter((j) => j.state === 'queued').length
-    const running = jobs.filter((j) => j.state === 'running').length
-    const done = jobs.filter((j) => j.state === 'done').length
-    const failed = jobs.filter((j) => j.state === 'failed').length
+    const list = jobsOf()
+    const queued = list.filter((j) => j.state === 'queued').length
+    const running = list.filter((j) => j.state === 'running').length
+    const done = list.filter((j) => j.state === 'done').length
+    const failed = list.filter((j) => j.state === 'failed').length
+    const busy = biliBusy && (biliBusy.corpus || 'dufuzhixin') === profileOf().id ? biliBusy : null
     return {
-      total: jobs.length, queued, running, done, failed,
-      busy: biliBusy ? { id: biliBusy.id, bvid: biliBusy.bvid, stage: biliBusy.stage } : null,
+      total: list.length, queued, running, done, failed,
+      busy: busy ? { id: busy.id, bvid: busy.bvid, stage: busy.stage } : null,
       cachedFiles: countRoot(P().archive).dufu,
       landingFiles: countRoot(P().landing).dufu,
-      recent: jobs.slice(-8).reverse().map((j) => ({
+      recent: list.slice(-8).reverse().map((j) => ({
         id: j.id, bvid: j.bvid, state: j.state, stage: j.stage,
         message: j.message, duration: j.duration, textLength: j.textLength, cached: j.cached,
         startedAt: j.startedAt, endedAt: j.endedAt,
@@ -1093,7 +1134,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       job.stage = 'start'
       job.message = '启动转写'
       job.startedAt = nowIso()
-      saveJobs()
+      saveJobs(job.corpus)
       log(`转写开始 ${job.id} ${job.bvid}${job.force ? ' (force)' : ''}`)
       let stdout = ''
       let stderr = ''
@@ -1108,7 +1149,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         if (errMsg) log(`转写失败 ${job.id} ${job.bvid}: ${errMsg.slice(0, 300)}`)
         else log(`转写结束 ${job.id} ${job.bvid} state=${job.state} len=${job.textLength ?? '?'}`)
         biliBusy = null
-        saveJobs()
+        saveJobs(job.corpus)
         resolve()
       }
       // 命中缓存：三库任一有 ≥3000 字的同名稿就秒回（bridge 自己的缓存只看 --out 一个目录）。
@@ -1222,7 +1263,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       createdAt: nowIso(), startedAt: null, endedAt: null,
     }
     jobs.push(job)
-    saveJobs()
+    saveJobs(job.corpus)
     log(`转写入队 ${job.id} ${bvid}`)
     void drainBiliQueue()
     return { ok: true, job }
@@ -1270,8 +1311,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       if (biliBusy) return JSON.stringify({ ok: false, error: 'BUSY', message: `转写任务在跑（${biliBusy.id}），跑完再切语料`, active: ACTIVE_ID }, null, 2)
       const res = switchCorpus(id)
       if (!res.ok) return JSON.stringify({ ...res, ok: false }, null, 2)
-      jobs = readJson<BiliJob[]>(join(biliJobsDir(), 'jobs.json'), [])
-      if (!Array.isArray(jobs)) jobs = []
+      onCorpusChanged?.()
       saveState()
       log(`切换语料 → ${id}（${P().landing}）`)
       return JSON.stringify({ ...res, ok: true, landing: P().landing, archive: P().archive, state: P().state }, null, 2)
@@ -1349,7 +1389,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     },
     output: textOutput,
     async execute(args: Record<string, unknown>) {
-      const res = enqueueBili(String(args?.target ?? ''), args?.force === true)
+      const res = enqueueBili(String(args?.target ?? ''), args?.force === true, typeof args?.corpus === 'string' ? args.corpus : undefined)
       if (!res.ok) return JSON.stringify({ ok: false, error: res.error }, null, 2)
       if (args?.wait === true) {
         const deadline = Date.now() + 30 * 60 * 1000
@@ -1661,8 +1701,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
                 if (inFlight || biliBusy) { json(409, { ok: false, error: 'BUSY', active: ACTIVE_ID }); return }
                 const r = switchCorpus(id)
                 if (!r.ok) { json(400, r); return }
-                jobs = readJson<BiliJob[]>(join(biliJobsDir(), 'jobs.json'), [])
-                if (!Array.isArray(jobs)) jobs = []
+                onCorpusChanged?.()
                 saveState()
                 json(200, { ...r, landing: P().landing, archive: P().archive })
               } catch (e) {
