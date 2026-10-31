@@ -456,6 +456,8 @@ const PUNCT_APPLY = join(SCRIPT_DIR, 'punct_apply.py')
 const DONE_STATUS = new Set(['done', 'already', 'empty', 'skip'])
 const KINDS = new Set(['homophone', 'name', 'stutter', 'number', 'punct', 'other'])
 const BODY_LIMIT = Number(E.DSH_CORPUS_BODY_LIMIT || 60000)
+/** 单篇补丁输出的 token 预算：4000 会被推理 token 吃光导致 JSON 截断（2026-10-31 实测）。 */
+const LLM_MAX_TOKENS = Number(E.DSH_CORPUS_MAX_TOKENS || 16000)
 const AUTO = /^(1|true|yes|on)$/i.test(String(E.DSH_CORPUS_AUTO || ''))
 const INTERVAL_MS = Number(E.DSH_CORPUS_INTERVAL_MS || 900000)
 
@@ -968,6 +970,29 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     return out
   }
 
+  function numbersOf(s: string): string[] {
+    return String(s || '').match(/\d+/g) || []
+  }
+
+  /**
+   * 守卫（apply_smoothing.py）对「含数字改动」的补丁只认 kind=number（kind=name 仅限两边都是
+   * ASCII 代号的术语级改写）。模型经常把 `57奇→武契奇` 这类数字误听标成 name，于是在守卫那里
+   * 整条被丢——2026-10-31 实测 44 条里丢了 4 条都是这个原因。这里按守卫口径就地改写 kind，
+   * 不吞补丁也不放行真正的数字改写（守卫的 number 校验照旧打印 WARN）。
+   */
+  function normalizeDigitKinds(list: Array<Record<string, unknown>>, bvid: string): void {
+    for (const p of list) {
+      const kind = String(p.kind || 'other')
+      if (kind === 'number' || kind === 'stutter') continue
+      const a = numbersOf(String(p.find)).join('|')
+      const b = numbersOf(String(p.replace)).join('|')
+      if (a === b) continue
+      p.kind = 'number'
+      p.why = `${String(p.why || '')}（原 kind=${kind}；含数字改动，按守卫口径改写为 number）`.trim()
+      log(`自动改 kind=number（含数字改动）${bvid}: ${String(p.find).slice(0, 24)}`)
+    }
+  }
+
   /** 专名核实（可选）：对 kind=name 的补丁取前 3 条各搜一次，把证据写进 why。 */
   async function verifyNames(bvid: string, body: string, patches: Array<Record<string, unknown>>): Promise<number> {
     const web = (() => { try { return ctx.get('web') } catch { return undefined } })()
@@ -1016,22 +1041,28 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const user = `bvid: ${bvid}\n文件: ${file}\n\n${body}`
     let patches: Array<Record<string, unknown>> | null = null
     let parsed: string | null = null
-    for (let attempt = 1; attempt <= 2 && patches === null; attempt += 1) {
+    let maxTokens = LLM_MAX_TOKENS
+    for (let attempt = 1; attempt <= 3 && patches === null; attempt += 1) {
       try {
         const sys = attempt === 1
           ? SYSTEM_PROMPT
-          : `${SYSTEM_PROMPT}\n\n注意：上一次输出不是合法 JSON。这一次**只输出一个 JSON 对象**，不要任何多余文字。`
-        const r = await callLlm(sys, user, 4000)
-        patches = parsePatches(r.text, bvid)
+          : `${SYSTEM_PROMPT}\n\n注意：上一次输出不是合法 JSON（可能是输出过长被截断）。这一次**只输出一个 JSON 对象**，不要任何多余文字。`
+        const r = await callLlm(sys, user, maxTokens)
         parsed = r.text
-      } catch (e) {
-        if (attempt === 2) {
-          log(`LLM/解析失败（记 no_patch 继续）${bvid}: ${String(e).slice(0, 200)}`)
-          return 'no_patch'
+        patches = parsePatches(r.text, bvid)
+        if (r.usage && r.usage.output >= maxTokens - 32) {
+          log(`注意 ${bvid}：输出贴近 token 上限（${r.usage.output}/${maxTokens}），若补丁偏少请人工复核`)
         }
+      } catch (e) {
+        const cut = /未找到 JSON 对象|Unterminated|Unexpected end|Unexpected token/.test(String(e))
+        log(`LLM/解析失败（第 ${attempt} 次，${cut ? '疑似截断' : '格式错误'}）${bvid}: ${String(e).slice(0, 160)}`)
+        if (attempt === 3) return 'no_patch'
+        // 截断 → 下一次给双倍预算（最多 64000）；格式错误则保持不变
+        if (cut) maxTokens = Math.min(maxTokens * 2, 64000)
       }
     }
     if (patches === null) return 'no_patch'
+    normalizeDigitKinds(patches, bvid)
     if (patches.length === 0) return 'empty'
     try {
       await verifyNames(bvid, body, patches)
@@ -1757,6 +1788,45 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         job: res.job,
         hint: res.job.state === 'queued' ? '已入队；用 bili_jobs 查进度，或看面板「转写」区' : undefined,
         queue: biliSummary(),
+      }, null, 2)
+    },
+  })
+
+  register({
+    name: 'bili_discover',
+    description: '发现新视频（只列清单，不下载不转写）：抓 UP 主最近投稿，排除已有稿件、游戏切片、充电专属缓存、带货广告与碎片。返回候选 bvid + 发布日期 + 标题。每日流程第一步：bili_discover → 对每个 bvid 调 bili_transcribe → corpus_batch。',
+    parameters: {
+      type: 'object',
+      properties: {
+        pages: { type: 'integer', description: '抓取投稿页数（每页 50 条，默认 5 页 = 最近 250 条）' },
+        days: { type: 'integer', description: '只看最近几天发布的（默认 7）' },
+      },
+    },
+    output: textOutput,
+    async execute(args: Record<string, any>) {
+      const pages = Number(args?.pages) > 0 ? Number(args.pages) : 5
+      const days = Number(args?.days) > 0 ? Number(args.days) : 7
+      const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'engine', 'discover.py')
+      const r = run(PY_BILI, [script, '--json', '--pages', String(pages), '--days', String(days)], {
+        cwd: dirname(script), timeoutMs: 900000,
+      })
+      const line = r.out.split(/\r?\n/).reverse().find((l) => l.trim().startsWith('{"count"'))
+      if (!line) {
+        return JSON.stringify({ ok: false, error: 'DISCOVER_FAILED', rc: r.rc, tail: tail(r.out) }, null, 2)
+      }
+      const parsed = JSON.parse(line) as { count: number; items: any[] }
+      const candidates = (parsed.items || []).map((it: any) => (
+        Array.isArray(it)
+          ? { bvid: it[0], date: it[1], time: it[2], title: it[3] }
+          : { bvid: it.bvid, date: it.date, time: it.time, title: it.title }
+      ))
+      return JSON.stringify({
+        ok: true,
+        count: candidates.length,
+        candidates,
+        hint: candidates.length > 0
+          ? '对每个 bvid 调 bili_transcribe（可 wait=true），全部落盘后再 corpus_batch kind=error'
+          : '没有需要转写的新视频',
       }, null, 2)
     },
   })

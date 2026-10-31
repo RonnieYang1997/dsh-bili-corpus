@@ -18,7 +18,31 @@ import os, sys, json, hashlib, urllib.parse, urllib.request, ssl, time, re, stru
 # Configuration
 # ============================================================
 
-COOKIE = """buvid3=BD0DD468-47CF-7F48-2277-9E3AD48AF71E99147infoc; b_nut=1781780499; _uuid=CED910937-510A-2161-710EE-F981E69DCF6F99579infoc; buvid4=125CEECD-B4F4-6DAE-A6CD-6D109DBCE97799998-026061819-TPpxjCBfEwVChszUxtW1Og%3D%3D; buvid_fp=763187db5e6af21e27ab374542615b11; DedeUserID=25797327; DedeUserID__ckMd5=b8e3c191a042a045; theme-tip-show=SHOWED; rpdid=|(J|J|kml~kY0J'u~)u~)umuY; theme-avatar-tip-show=SHOWED; lang=zh-Hans; LIVE_BUVID=AUTO6017823957501377; CURRENT_QUALITY=80; hit-dyn-v2=1; PVID=2; bili_ticket=eyJhbGciOiJIUzI1NiIsImtpZCI6InMwMyIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTAyNTA0NzEsImlhdCI6MTc4OTk5MTIxMSwicGx0IjotMX0.PX3HXzrzTaywgAtvnmuzJ-4QOGyrf_OK1MoiT2S79QQ; bili_ticket_expires=1790250411; bmg_af_switch=1; bmg_src_def_domain=i1.hdslb.com; bmg_af_sc={"none":{"on":1,"def":"i1.hdslb.com"},"sgp":{"on":1,"def":"i1-sgp.hdslb.com"}}; SESSDATA=00388db1%2C1805639261%2C3a8d9%2A91CjB5nVUdKsqmKoCDnw68PBeye5n5YrF3ZxHaA5ObKGgXfCRb74wx-Q67IfoMJF-gWFcSVk1MN2JCdExZaUE3S0NaN3BOWlpXODdvelZDdUpkTGMtc0MxdklJTFU5RFVlZ3BBal9ueUljcFBPVzZieVh4NnFKaDBsR3hRT20wbG5ydElCVkJKQWx3IIEC; bili_jct=484ccb9a644ddc182db1c7d2333beb2e; sid=7o4x3eeu; bp_t_offset_25797327=1251265204734394368; CURRENT_FNVAL=4048; home_feed_column=4; browser_resolution=476-695; b_lsid=A4E2CDE6_1A0CEAE6DD5"""
+_DEFAULT_COOKIE = ""  # 不在仓库里存 cookie：从 BILI_COOKIE 环境变量或 ~/.dsh/bili-cookie.txt 读取
+
+
+COOKIE_FILE = "C:\\Users\\Ronnie/.dsh/bili-cookie.txt"
+
+
+def _load_cookie():
+    """Cookie 取法：环境变量 BILI_COOKIE → ~/.dsh/bili-cookie.txt → 下方内置兜底。
+
+    换 cookie 只要覆盖文件（或设环境变量）即可，不用改代码。
+    """
+    v = str(os.environ.get("BILI_COOKIE") or "").strip()
+    if v:
+        return v
+    try:
+        if os.path.isfile("C:\\Users\\Ronnie/.dsh/bili-cookie.txt"):
+            t = open("C:\\Users\\Ronnie/.dsh/bili-cookie.txt", encoding="utf-8-sig").read().strip()
+            if t:
+                return t
+    except Exception:
+        pass
+    return _DEFAULT_COOKIE
+
+
+COOKIE = _load_cookie()
 
 # 2026-10-09：在线 Whisper 的端点与密钥已**全部移除**（连同 multipart 上传代码）。
 # 现役识别引擎 = 本机 SenseVoice，见文件末尾的 "Local ASR" 一节。

@@ -138,6 +138,7 @@ STRAY_OK = {                        # basename -> roots where it is a legitimate
     "no-git-operations.md": {"main"},      # main-only marker, see R20
     "charging_videos.json": {"mirror"},    # state file written by daily_scan.py
     "gaming_videos.json":   {"mirror"},
+    "excluded_videos.json": {"mirror"},    # 手工排除清单（短剧/切片），由 discover.py 维护
 }
 
 
