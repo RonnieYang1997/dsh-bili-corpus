@@ -70,6 +70,24 @@ DEFAULT_ROOTS = [
 ]
 DEFAULT_BASELINE = Path(os.environ.get("DSH_CORPUS_LINT_BASELINE") or (HERE / "corpus_lint_baseline.json"))
 
+# P3：命名解耦 —— 稿子不再要求 `dufu-` 前缀，只要文件名里带 BV 号就认。
+#   `dufu-BVxxxxxxxxxx.md`（独夫之心）与 `视频标题-BVxxxxxxxxxx.md`（标题式语料）同等对待。
+BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
+DOC_PREFIX = os.environ.get("DSH_CORPUS_DOC_PREFIX") or "dufu-"
+MIN_TRANSCRIPTS = int(os.environ.get("DSH_CORPUS_MIN_TRANSCRIPTS") or 1000)
+
+
+def is_transcript(name):
+    """是不是一篇转写稿：.md 且文件名里带 BV 号（与命名策略无关）。"""
+    n = str(name)
+    return n.endswith(".md") and bool(BV_RE.search(n))
+
+
+def doc_stem_ok(stem):
+    """索引行的 stem 像不像一篇稿子（文件名带 BV 号）。"""
+    return bool(BV_RE.search(str(stem)))
+
+
 PUA        = re.compile("[\ue000-\uf8ff]")
 REPL       = "\ufffd"
 RE_JUNK_A  = re.compile(r"@\{page=.*\}\.date\)")
@@ -136,7 +154,7 @@ def lint_stray(root, tag):
         yield "语料根目录存在杂散文件", p.name
 
 
-def assert_corpus_root(root, min_transcripts=1000):
+def assert_corpus_root(root, min_transcripts=None):
     """R20: refuse to touch a directory that is not obviously the corpus.
 
     A mis-typed root once resolved to a 2026-07-18 snapshot holding 19 files; the
@@ -148,11 +166,13 @@ def assert_corpus_root(root, min_transcripts=1000):
     root = Path(root)
     if not root.is_dir():
         raise SystemExit("R20: corpus root does not exist: %s" % root)
-    n = sum(1 for _ in root.glob("dufu-BV*.md"))
+    if min_transcripts is None:
+        min_transcripts = MIN_TRANSCRIPTS
+    n = sum(1 for _ in root.glob("*.md") if is_transcript(_.name))
     marker = (root / "no-git-operations.md").exists()
     if n < min_transcripts and not marker:
         raise SystemExit(
-            "R20: %s does not look like the corpus (%d dufu-BV*.md, marker=%s). "
+            "R20: %s does not look like the corpus (%d transcripts, marker=%s). "
             "Real path is probably under aionrs\\projects\\C--Users-...\\memory"
             % (root, n, marker))
     return root
@@ -180,10 +200,10 @@ def lint_frontmatter(text, name):
     fm = frontmatter(text)
     if fm is None:
         return
-    if name.startswith("dufu-") and not fm.strip():
+    if is_transcript(name) and not fm.strip():
         yield "frontmatter 内容为空", ""
         return
-    if not TRANSCRIPT.match(name):
+    if not is_transcript(name):
         return
 
     title = fmval(fm, RE_TITLE)
@@ -282,15 +302,21 @@ def lint_memory_index(root):
         return
     names = []
     for i, line in enumerate(text.splitlines(), 1):
-        if "dufu-BV" not in line:
+        if not (BV_RE.search(line) or DOC_PREFIX in line):
             continue
-        m = RE_IDX_OK.match(line)
-        if m:
-            names.append(m.group(1))
-            continue
-        if RE_IDX_ANY.match(line):
+        m = re.match(r"^- (\S.*)$", line)
+        if not m or m.group(1).startswith("["):
             yield ("MEMORY.md 索引行格式错误 (缺 bullet/链接式)",
                    "line %d: %s" % (i, line[:40]))
+            continue
+        stem = m.group(1).split(":", 1)[0].strip()
+        if stem.lower().endswith(".md"):
+            stem = stem[:-3]
+        if not doc_stem_ok(stem):
+            yield ("MEMORY.md 索引行格式错误 (缺 bullet/链接式)",
+                   "line %d: %s" % (i, line[:40]))
+            continue
+        names.append(stem)
     seen, dup = set(), set()
     for n in names:
         if n in seen:
@@ -298,7 +324,7 @@ def lint_memory_index(root):
         seen.add(n)
     for n in sorted(dup):
         yield "MEMORY.md 索引重复条目", n
-    on_disk = {q.stem for q in root.glob("dufu-BV*.md")}
+    on_disk = {q.stem for q in root.glob("*.md") if is_transcript(q.name)}
     for n in sorted(on_disk - seen):
         yield "MEMORY.md 索引缺条目", n
     for n in sorted(seen - on_disk):
@@ -364,9 +390,9 @@ def main():
         return 2
     # R20: a mis-resolved root silently looks "clean" because it contains few files
     for r in roots:
-        n_t = sum(1 for _ in r.glob("dufu-BV*.md"))
-        if n_t < 1000 and not (r / "no-git-operations.md").exists():
-            print("WARNING R20: %s does not look like the corpus (%d dufu-BV*.md). "
+        n_t = sum(1 for _ in r.glob("*.md") if is_transcript(_.name))
+        if n_t < MIN_TRANSCRIPTS and not (r / "no-git-operations.md").exists():
+            print("WARNING R20: %s does not look like the corpus (%d transcripts). "
                   "Did the path lose a level?" % (r, n_t), file=sys.stderr)
 
     found, per_root = scan(roots)

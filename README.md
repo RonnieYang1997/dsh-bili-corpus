@@ -52,7 +52,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 
 | 工具 | 作用 |
 | --- | --- |
-| `bili_transcribe {target, force?, wait?}` | 入队一个转写任务。target 可为 BVID、链接或整段分享文案；`force` 忽略缓存重转；`wait=true` 最多阻塞 30 分钟。返回 jobId，或任务结束时的终态。 |
+| `bili_transcribe {target, force?, wait?, corpus?, propose?, name?}` | 入队一个转写任务。target 可为 BVID、链接或整段分享文案；`force` 忽略缓存重转；`wait=true` 最多阻塞 30 分钟；`corpus` 指定语料；`propose=true` 只取标题给建议名；`name` 指定产物文件名（标题式语料必需）。返回 jobId，或任务结束时的终态。 |
 | `bili_jobs {id?, limit?, clear?}` | 任务队列摘要 / 单任务明细 / 清掉已结束记录。 |
 | `corpus_status` | 清洗线全量状态：落点 / 存档两处文件数、错字与标点进度、最近一批、在跑批次、暂停、门禁、token。 |
 | `corpus_gates` | 跑门禁（对「产物存档」单根跑 lint 带 baseline + selftest），返回 `nextBatchAllowed`。 |
@@ -119,6 +119,8 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `DSH_CORPUS_SCRATCH` | `legacy` 模式下的旧脚本目录，默认 `C:/Users/Ronnie/Documents/deepseek-harness/default-workspace/_scratch` |
 | `DSH_CORPUS_ID` | 宿主自动传：把语料 id 打进台账批次记录（`corpus` 字段），便于排查串库 |
 | `DSH_CORPUS_AUTO` | `false`（不自动跑批） |
+| `DSH_CORPUS_MIN_TRANSCRIPTS` | `1000`（lint 的 R20 目录可信度阈值；demo 这类小语料靠 `no-git-operations.md` 标记放行） |
+| `DSH_CORPUS_DOC_PREFIX` | `dufu-`（宿主导出给清洗脚本；命名策略另有 `naming: bvid|title`） |
 
 ## 转写引擎（P1：已内嵌，2026-10-31）
 
@@ -185,8 +187,32 @@ demo 语料真批次（非 dryRun）也跑通：批 3 → queue 4 → 补丁 7 �
 台账批次记录现在带 `corpus` 字段（宿主自动传 `DSH_CORPUS_ID`），配合「每语料一个 STATE 目录」
 可以一眼看出某批属于谁。
 
-注意：`corpus_lint.py` 的规则仍按 `dufu-BV*.md` 命名写死（`docPrefix` 只影响读写与索引），
-换非 `dufu-` 前缀的语料要先改 lint 规则。
+**命名策略（P3：`bvid` ｜ `title`，2026-10-31）**
+
+语料在 `corpora.json` 里声明 `"naming": "bvid" | "title"`：
+
+| naming | 产物文件名 | 适用 |
+| --- | --- | --- |
+| `bvid`（默认） | `dufu-BVxxxxxxxxxx.md` | 独夫之心这类历史语料 |
+| `title` | `视频标题-BVxxxxxxxxxx.md`（`fileName` 模板默认 `{title}-{bvid}.md`） | 其它视频，标题可读可检索 |
+
+标题式语料转写前会**先问名字**（两步）：
+
+1. `bili_transcribe {target, propose: true}` → 只取元数据（不下载不 ASR），回
+   `{ok, title, suggested: "标题-BVxxx.md", hint}`；
+2. 用户确认（或改名）后 `bili_transcribe {target, name: "<文件名>", force: true, wait: true}` → 真转写。
+
+标题式语料不带 `name` 直接调用时不会入队，而是回 `{ok:false, needName:true, suggested, hint}`；
+面板（B站语料）里也是「转写」按钮 → 服务端回 needName → 输入框自动填上建议名 → 再点一次。
+`name` 缺 BV 号会自动补 `-<bvid>`；标题里的 `\/:*?"<>|` 会被 `titleSlug()` 清掉、空白压成 `-`、限 60 字。
+
+**存档去重**：同一 bvid 在存档里已有另一个文件名的稿时不重复归档（保留原稿，日志
+「存档已有 X（同视频），保留原稿不重复归档」）；需要覆盖只能显式 `overwrite`（目前只有内部调用）。
+
+**lint 解耦**：`corpus_lint.py` 不再要求 `dufu-` 前缀——只要文件名里带 `BV[0-9A-Za-z]{10}` 就算一篇稿，
+索引行也接受任意 `- <stem>`（`dufu-BV...` 与 `标题-BV...` 等价）。`corpus_lint_selftest.py` 的
+fixture 已改成合法 BV 号，`SELFTEST PASS`。
+
 
 ## 已知坑（都是踩过的）
 

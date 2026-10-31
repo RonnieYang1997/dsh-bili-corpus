@@ -619,7 +619,7 @@ def transcribe_long_audio(m4a_path, language='zh', model=None):
 # Transcript Saving
 # ============================================================
 
-def save_transcript(bvid, text, video_info=None, output_dir=None):
+def save_transcript(bvid, text, video_info=None, output_dir=None, name=None):
     """Save transcript as a memory file. Returns file path."""
     # R21: the last line of defence - an error payload must never become a transcript
     # file (14 such files had to be cleaned out of the corpus by hand).
@@ -658,7 +658,8 @@ source: "bilibili"
 {extra}---
 
 """
-    filepath = os.path.join(output_dir, f'dufu-{bvid}.md')
+    # P3：文件名可由调用方指定（标题式命名）；默认仍是 dufu-<bvid>.md
+    filepath = os.path.join(output_dir, name or f'dufu-{bvid}.md')
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(yaml_header)
         f.write(text)
@@ -669,7 +670,7 @@ source: "bilibili"
 # Full Pipeline
 # ============================================================
 
-def process_video(bvid, output_dir=None, temp_dir=None):
+def process_video(bvid, output_dir=None, temp_dir=None, name=None):
     """Full pipeline: download audio → transcribe → save transcript."""
     if temp_dir is None:
         temp_dir = os.path.join(os.getcwd(), '_transcribe_temp')
@@ -679,7 +680,7 @@ def process_video(bvid, output_dir=None, temp_dir=None):
         output_dir = os.path.join(os.getcwd(), 'memory')
 
     # Check if already transcribed (skip short/truncated files)
-    existing = os.path.join(output_dir, f'dufu-{bvid}.md')
+    existing = os.path.join(output_dir, name or f'dufu-{bvid}.md')
     if os.path.exists(existing):
         with open(existing, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -703,7 +704,7 @@ def process_video(bvid, output_dir=None, temp_dir=None):
     try:
         m4a_path, info = download_audio(bvid, temp_dir)
         text = transcribe_long_audio(m4a_path)
-        filepath = save_transcript(bvid, text, info, output_dir)
+        filepath = save_transcript(bvid, text, info, output_dir, name=name)
 
         return {
             'bvid': bvid,

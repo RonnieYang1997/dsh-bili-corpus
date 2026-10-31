@@ -35,11 +35,13 @@ def emit(payload):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bvid", required=True)
-    ap.add_argument("--out", required=True, help="转写产物目录（dufu-<bvid>.md 写这里）")
+    ap.add_argument("--out", default=os.getcwd(), help="转写产物目录（默认当前目录）；--propose 用不到")
     ap.add_argument("--temp", default=None, help="音频下载/切片临时目录")
     ap.add_argument("--lang", default="zh")
     ap.add_argument("--force", action="store_true", help="忽略已存在的转写稿，强制重转")
     ap.add_argument("--skill-dir", default=None, help="bilibili-transcribe 技能根目录")
+    ap.add_argument("--name", default=None, help="产物文件名（含 .md）；缺省 dufu-<bvid>.md")
+    ap.add_argument("--propose", action="store_true", help="只取视频元数据（标题/时长），不下载不转写")
     args = ap.parse_args()
 
     # ── 引擎解析（P1：内置引擎优先，外部技能目录只作覆盖/兜底）────────────
@@ -73,6 +75,18 @@ def main():
               "message": "import bilibili_transcribe 失败（%s）：%s" % (scripts_dir, e)})
         traceback.print_exc()
         return 1
+
+    # P3：--propose 只问元数据（给「标题式命名」确认用），不碰模型/ffmpeg/音频。
+    if args.propose:
+        try:
+            info = bt.get_video_info(args.bvid)
+            emit({"type": "result", "ok": True, "propose": True, "bvid": args.bvid,
+                  "title": info.get("title", ""), "date": info.get("date", ""),
+                  "duration": info.get("duration_sec", 0), "engine": engine_kind})
+            return 0
+        except Exception as e:
+            emit({"type": "result", "ok": False, "error": "META", "message": str(e)[:500]})
+            return 2
 
     # ── 预检（缺一个就直接失败，免得跑 20 分钟才发现）
     #     ffprobe 缺失时技能会静默降级成 300s 预览音频 → 长视频被截断却"成功"。
@@ -123,7 +137,7 @@ def main():
 
     wrap("download_audio", "download", "下载音频（WBI 签名 DASH）")
     wrap("transcribe_long_audio", "asr", "SenseVoice 本地识别")
-    wrap("save_transcript", "save", "写 dufu-<bvid>.md")
+    wrap("save_transcript", "save", "写 %s" % (args.name or "dufu-<bvid>.md"))
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -131,7 +145,7 @@ def main():
     os.makedirs(temp_dir, exist_ok=True)
 
     # --force：删掉旧稿，让 process_video 重新走全流程（它自己有 <3000 字的缓存判定）
-    target = os.path.join(out_dir, "dufu-%s.md" % args.bvid)
+    target = os.path.join(out_dir, args.name or ("dufu-%s.md" % args.bvid))
     if args.force and os.path.exists(target):
         try:
             os.remove(target)
@@ -141,7 +155,7 @@ def main():
             return 2
 
     try:
-        result = bt.process_video(args.bvid, output_dir=out_dir, temp_dir=temp_dir)
+        result = bt.process_video(args.bvid, output_dir=out_dir, temp_dir=temp_dir, name=args.name)
         path = result.get("path") or target
         # 别信返回值：落盘校验（非原子写 + 空正文都当失败，防止把半截稿当成功台账）
         if not os.path.isfile(path) or os.path.getsize(path) < 64:
@@ -165,6 +179,7 @@ def main():
             "textLength": body,
             "cached": bool(result.get("cached")),
             "engine": engine_kind,
+            "name": os.path.basename(path),
         }
         emit(payload)
         return 0

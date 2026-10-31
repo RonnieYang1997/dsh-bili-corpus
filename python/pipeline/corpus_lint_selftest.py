@@ -78,7 +78,7 @@ def main():
         b.mkdir()
         for i, (name, body, _) in enumerate(CASES, 1):
             # real transcript naming (dufu-BV<bvid>.md) so the R14/R17/R19 rules apply
-            fn = "dufu-BV1TEST%04d.md" % i
+            fn = "dufu-BV1TEST%05d.md" % i  # BV + 10 位字母数字
             (a / fn).write_text(body, encoding="utf-8", newline="")
             (b / fn).write_text(body, encoding="utf-8", newline="")
         # R18 fixtures
@@ -90,12 +90,12 @@ def main():
 
         # R27 fixtures: an index that lost a bullet, used a link, duped a name,
         # and forgot a file (while pointing at one that does not exist)
-        idx = ("- dufu-BV1TEST0001\r\n"
-               "dufu-BV1TEST0002\r\n"
-               "- [dufu-BV1TEST0003](dufu-BV1TEST0003.md) - 链接式\r\n"
-               "- dufu-BV1TEST0004\r\n"
-               "- dufu-BV1TEST0004\r\n"
-               "- dufu-BV1GHOST0001\r\n")
+        idx = ("- dufu-BV1TEST00001\r\n"
+               "dufu-BV1TEST00002\r\n"
+               "- [dufu-BV1TEST00003](dufu-BV1TEST00003.md) - 链接式\r\n"
+               "- dufu-BV1TEST00004\r\n"
+               "- dufu-BV1TEST00004\r\n"
+               "- dufu-BV1GHOST00001\r\n")
         for r in (a, b):
             (r / "MEMORY.md").write_text(idx, encoding="utf-8", newline="")
 

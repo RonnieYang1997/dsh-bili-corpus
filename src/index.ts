@@ -56,8 +56,12 @@ const ACTIVE_FILE = join(HOME, '.dsh', 'corpus', 'active-corpus.json')
 
 type CorpusProfile = {
   id: string
-  /** 稿件文件名前缀，例如 `dufu-`（文件名 = `${docPrefix}${bvid}.md`）。 */
+  /** 稿件文件名前缀，例如 `dufu-`（bvid 模式下 文件名 = `${docPrefix}${bvid}.md`）。 */
   docPrefix: string
+  /** 命名策略：`bvid` = `<docPrefix><bvid>.md`（历史/独夫之心）；`title` = `<标题>-<bvid>.md`。 */
+  naming: 'bvid' | 'title'
+  /** title 模式的模板（默认 `{title}-{bvid}.md`）；bvid 模式忽略。 */
+  fileName: string
   /** 每语料自己的索引文件（默认 MEMORY.md；空串 = 不维护索引）。 */
   indexFile: string
   landing: string
@@ -82,6 +86,8 @@ function envProfile(): CorpusProfile {
   return {
     id: 'dufuzhixin',
     docPrefix: 'dufu-',
+    naming: 'bvid',
+    fileName: '{title}-{bvid}.md',
     indexFile: 'MEMORY.md',
     landing: E.DSH_CORPUS_MAIN || join(HOME, '.dsh', 'corpus', 'dufuzhixin', 'memory'),
     archive: E.DSH_CORPUS_ARCHIVE || E.DSH_CORPUS_MIRROR || 'C:/Users/Ronnie/Documents/GitHub/dufuzhixin/memory',
@@ -112,7 +118,10 @@ function loadProfiles(): Record<string, CorpusProfile> {
   for (const [id, raw] of Object.entries<any>(corpora)) {
     if (!id || !raw || typeof raw !== 'object') continue
     const strs = Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'string' && v))
-    out[id] = { ...base, ...strs, id } as CorpusProfile
+    const merged = { ...base, ...strs, id } as CorpusProfile
+    merged.naming = merged.naming === 'title' ? 'title' : 'bvid'
+    merged.fileName = merged.fileName || '{title}-{bvid}.md'
+    out[id] = merged
   }
   PROFILES = out
   const saved = readJsonFile<{ active?: string }>(ACTIVE_FILE, {})
@@ -180,16 +189,47 @@ function corporaSummary(): Record<string, unknown> {
     file: CORPORA_FILE,
     root: join(HOME, '.dsh', 'corpus'),
     corpora: Object.values(map).map((p) => ({
-      id: p.id, docPrefix: p.docPrefix, indexFile: p.indexFile,
+      id: p.id, docPrefix: p.docPrefix, naming: p.naming, fileName: p.fileName, indexFile: p.indexFile,
       landing: p.landing, archive: p.archive, state: p.state,
     })),
   }
 }
 
-/** 稿件文件名（按语料前缀，P0 起不再写死 dufu-）。 */
-function docName(id: string, prefix: string = P().docPrefix): string { return `${prefix}${id}.md` }
-function isDocName(file: string, prefix: string = P().docPrefix): boolean {
-  return file.startsWith(prefix) && file.endsWith('.md')
+const BV_TOKEN = /BV[0-9A-Za-z]{10}/
+
+/** 标题 → 安全文件名片段：去非法字符、空白压成连字符、限长 60（保留中文）。 */
+function titleSlug(title: string): string {
+  const cleaned = String(title || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return cleaned.slice(0, 60) || 'untitled'
+}
+
+/** 稿件文件名：bvid 模式 = `<docPrefix><bvid>.md`；title 模式 = `<标题>-<bvid>.md`。 */
+function docNameFor(id: string, title?: string | null, p: CorpusProfile = P()): string {
+  if (p.naming === 'title' && title) {
+    const tpl = p.fileName || '{title}-{bvid}.md'
+    const name = tpl.split('{title}').join(titleSlug(title)).split('{bvid}').join(id)
+    return name.endsWith('.md') ? name : `${name}.md`
+  }
+  return `${p.docPrefix}${id}.md`
+}
+
+/** 是不是一篇转写稿：.md 且名字里带 BV 号（任何命名策略都满足），或带该语料前缀。 */
+function isDocName(file: string, p: CorpusProfile = P()): boolean {
+  return file.endsWith('.md') && (BV_TOKEN.test(file) || (p.docPrefix !== '' && file.startsWith(p.docPrefix)))
+}
+
+/** 在某个目录里按 bvid 找稿（命名策略无关：只要文件名里有 BV 号）。 */
+function findDocIn(root: string, bvid: string): string | null {
+  try {
+    for (const f of readdirSync(root)) {
+      if (f.endsWith('.md') && f.includes(bvid)) return join(root, f)
+    }
+  } catch { /* 目录不存在 */ }
+  return null
 }
 
 const ledgerPath = (p: CorpusProfile = P()): string => join(p.state, 'ledger.json')
@@ -375,6 +415,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
           },
           demo: {
             docPrefix: 'dufu-',
+            naming: 'title',
             indexFile: 'MEMORY.md',
             landing: join(HOME, '.dsh', 'corpus', 'demo', 'memory'),
             archive: join(HOME, 'Documents', 'GitHub', 'demo-corpus', 'memory'),
@@ -451,8 +492,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   /** 找稿：新稿落点 → 产物存档（存档是唯一校准源）。 */
   function findDoc(bvid: string): string | null {
     for (const root of [P().landing, P().archive]) {
-      const p = join(root, docName(bvid))
-      if (existsSync(p)) return p
+      const p = findDocIn(root, bvid)
+      if (p) return p
     }
     return null
   }
@@ -467,13 +508,15 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   /** MEMORY.md 索引：没有就补一行 `- dufu-<bvid>`（R27 只认这种行形；保持原文件的换行风格）。 */
   /** 索引行：缺就补一行 `- <prefix><id>`（R27 行形；保持原文件换行风格）。 */
-  function ensureIndexLine(root: string, bvid: string): void {
+  function ensureIndexLine(root: string, bvid: string, fileName?: string | null): void {
     const indexName = P().indexFile
     if (!indexName) return // indexFile 为空 = 该语料不维护索引
     const file = join(root, indexName)
     try {
       const text = existsSync(file) ? readFileSync(file, 'utf8') : ''
-      const line = `- ${P().docPrefix}${bvid}`
+      // 索引行 = 稿件文件名去掉 .md（R27 认「`- <stem>`」，与命名策略无关）
+      const stem = (fileName ? basename(fileName) : docNameFor(bvid)).replace(/\.md$/i, '')
+      const line = `- ${stem}`
       const already = text.split(String.fromCharCode(10)).some((l) => {
         const t = l.trim()
         return t === line || t === `${line}.md`
@@ -493,12 +536,19 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
    * 所以存档里已有同名稿时默认**保留**原样，只有显式 overwrite 才覆盖。
    */
   function archiveDoc(bvid: string, srcPath?: string, opts: { overwrite?: boolean } = {}): { archived: boolean; kept: boolean } {
-    const src = srcPath || join(P().landing, docName(bvid))
-    const dst = join(P().archive, docName(bvid))
+    const src = srcPath || findDoc(bvid)
+    const fileName = src ? basename(src) : docNameFor(bvid)
+    const dst = join(P().archive, fileName)
+    // 同一 bvid 在存档里已有别的文件名的稿：说明换过命名策略，保留已有的，避免重复。
+    const existingArchive = findDocIn(P().archive, bvid)
+    if (existingArchive && basename(existingArchive) !== fileName && !opts.overwrite) {
+      log(`存档已有 ${basename(existingArchive)}（同视频），保留原稿不重复归档：${bvid}`)
+      return { archived: false, kept: true }
+    }
     let archived = false
     let kept = false
     try {
-      if (existsSync(src)) {
+      if (src && existsSync(src)) {
         ensureDir(P().archive)
         if (!existsSync(dst)) {
           copyFileSync(src, dst)
@@ -516,8 +566,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     } catch (e) {
       log(`归档失败 ${bvid}: ${String(e).slice(0, 200)}`)
     }
-    ensureIndexLine(P().landing, bvid)
-    ensureIndexLine(P().archive, bvid)
+    ensureIndexLine(P().landing, bvid, fileName)
+    ensureIndexLine(P().archive, bvid, fileName)
     return { archived, kept }
   }
 
@@ -530,13 +580,13 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     let copied = 0
     const missing: string[] = []
     for (const bvid of bvids) {
-      const dst = join(P().landing, docName(bvid))
-      if (existsSync(dst)) continue
-      const src = join(P().archive, docName(bvid))
-      if (!existsSync(src)) {
+      if (findDocIn(P().landing, bvid)) continue
+      const src = findDocIn(P().archive, bvid)
+      if (!src) {
         missing.push(bvid)
         continue
       }
+      const dst = join(P().landing, basename(src))
       try {
         ensureDir(P().landing)
         copyFileSync(src, dst)
@@ -1058,6 +1108,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     force: boolean
     /** 入队时绑定的语料（执行期间按它切 profile，避免中途切换语料串库）。 */
     corpus?: string
+    /** 稿件文件名（标题式语料由用户确认；null = 用该语料的默认命名）。 */
+    name?: string | null
     createdAt: string
     startedAt: string | null
     endedAt: string | null
@@ -1147,6 +1199,25 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
   }
 
+  /** 只取视频元数据（标题/时长）给标题式命名提建议：不下载、不转写、不碰模型。 */
+  function proposeBili(bvid: string): { ok: boolean; title?: string; duration?: number; error?: string } {
+    const res = run(PY_BILI, [BRIDGE, '--bvid', bvid, '--propose'], { cwd: PIPELINE, timeoutMs: 180000 })
+    let found: Record<string, any> | null = null
+    for (const line of String(res.out || '').split('\n')) {
+      const s = line.trim()
+      if (!s.startsWith('{')) continue
+      try {
+        const m = JSON.parse(s) as Record<string, any>
+        if (m && (m.propose || m.error)) found = m
+      } catch { /* 非 JSON 行 */ }
+    }
+    if (!found) return { ok: false, error: String(res.error || res.out || 'propose 无输出').slice(0, 300) }
+    if (found.ok === true && found.propose === true) {
+      return { ok: true, title: found.title ? String(found.title) : undefined, duration: Number(found.duration) || undefined }
+    }
+    return { ok: false, error: String(found.message || found.error || 'propose 失败') }
+  }
+
   /** 跑一次 bridge.py；stdout 每行一个 JSON（stage / result）。 */
   function runBridge(job: BiliJob): Promise<void> {
     return new Promise((resolve) => {
@@ -1154,6 +1225,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         BRIDGE, '--bvid', job.bvid, '--out', P().landing, '--temp', join(P().state, 'bili-temp'),
         '--lang', 'zh',
       ]
+      if (job.name) args.push('--name', job.name)
       if (BILI_SKILL_DIR) args.push('--skill-dir', BILI_SKILL_DIR)
       if (job.force) args.push('--force')
       job.state = 'running'
@@ -1185,7 +1257,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
           const len = docChars(hit)
           const arch = archiveDoc(job.bvid, hit)
           finish({
-            state: 'done', stage: 'done', path: join(P().archive, docName(job.bvid)),
+            state: 'done', stage: 'done', path: join(P().archive, basename(hit)),
             textLength: len, cached: true,
             message: `命中缓存（${basename(dirname(hit))}）${arch.archived ? ' · 已补归档' : arch.kept ? ' · 存档已有稿（保留）' : ''}`,
           })
@@ -1198,6 +1270,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       }, BILI_TIMEOUT_MS)
       let child: ReturnType<typeof spawn>
       try {
+        ensureDir(P().state)
         child = spawn(PY_BILI, args, {
           cwd: P().state,
           windowsHide: true,
@@ -1233,7 +1306,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
               if (msg.ok === true) {
                 // 落点在 P().landing（临时落脚）；真正的产物要归档进 git 仓 + 补索引。
                 const arch = msg.cached === true ? { archived: false, kept: false } : archiveDoc(job.bvid)
-                const productPath = join(P().archive, docName(job.bvid))
+                const productPath = msg.path ? join(P().archive, basename(String(msg.path))) : ''
                 finish({
                   state: 'done', stage: 'done',
                   path: existsSync(productPath) ? productPath : (msg.path ? String(msg.path) : null),
@@ -1275,7 +1348,12 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
   }
 
-  function enqueueBili(input: string, force: boolean, corpus?: string): { ok: true; job: BiliJob } | { ok: false; error: string } {
+  function enqueueBili(
+    input: string,
+    force: boolean,
+    corpus?: string,
+    name?: string | null,
+  ): { ok: true; job: BiliJob } | { ok: false; error: string } {
     const bvid = extractBvid(input)
     if (!bvid) return { ok: false, error: `无法从输入里认出 BVID：${String(input).slice(0, 80)}` }
     const existing = jobs.find((j) => j.bvid === bvid && (j.state === 'queued' || j.state === 'running'))
@@ -1286,6 +1364,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       state: 'queued', stage: 'queued', message: '排队中',
       path: null, duration: null, textLength: null, cached: false, force,
       corpus: profileOf(corpus).id,
+      name: name || null,
       createdAt: nowIso(), startedAt: null, endedAt: null,
     }
     jobs.push(job)
@@ -1403,19 +1482,64 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   register({
     name: 'bili_transcribe',
-    description: '把 B 站视频转成稿件 dufu-<bvid>.md（本地 SenseVoice 转写，不走云端）。入队一次转写（全局单并发），返回 jobId；用 bili_jobs 查进度。输入可传 BVID、视频链接或整段分享文案。',
+    description: '把 B 站视频转成稿件（本地 SenseVoice 转写，不走云端）。入队一次转写（全局单并发），返回 jobId；用 bili_jobs 查进度。输入可传 BVID、视频链接或整段分享文案。标题式语料（naming=title）必须带 name，可先用 propose=true 拿建议名。',
     parameters: {
       type: 'object',
       properties: {
         target: { type: 'string', description: 'BVID / 视频链接 / 分享文案' },
         force: { type: 'boolean', description: '忽略已有缓存强制重转（默认 false：主库已有 ≥3000 字的同名稿就秒回 cached）' },
         wait: { type: 'boolean', description: '阻塞等到该任务结束（最多 30 分钟）。默认 false：立刻返回 jobId' },
+        propose: { type: 'boolean', description: '只取视频元数据（标题/时长）并给出建议文件名，不转写（默认 false）' },
+        name: { type: 'string', description: '稿件文件名（标题式语料必填，如「标题-BV号.md」；bvid 式可省略）' },
       },
       required: ['target'],
     },
     output: textOutput,
     async execute(args: Record<string, unknown>) {
-      const res = enqueueBili(String(args?.target ?? ''), args?.force === true, typeof args?.corpus === 'string' ? args.corpus : undefined)
+      const target = String(args?.target ?? '')
+      const bvid = extractBvid(target)
+      if (!bvid) return JSON.stringify({ ok: false, error: `无法从输入里认出 BVID：${target.slice(0, 80)}` }, null, 2)
+      const corpusId = typeof args?.corpus === 'string' ? args.corpus : undefined
+      const prof = profileOf(corpusId)
+      let name = typeof args?.name === 'string' && args.name.trim() ? args.name.trim() : null
+      if (name && !/\.md$/i.test(name)) name += '.md'
+      // 文件名必须带 BV 号（否则缓存命中 / 回查 / 门禁都认不出它）
+      if (name && !name.includes(bvid)) name = `${name.replace(/\.md$/i, '')}-${bvid}.md`
+
+      const wantPropose = args?.propose === true
+      if (!name && (wantPropose || prof.naming === 'title')) {
+        const meta = proposeBili(bvid)
+        const suggested = docNameFor(bvid, meta.ok ? meta.title : null, prof)
+        if (wantPropose) {
+          return JSON.stringify({
+            ok: meta.ok,
+            propose: true,
+            bvid,
+            corpus: prof.id,
+            naming: prof.naming,
+            title: meta.title ?? null,
+            duration: meta.duration ?? null,
+            suggested,
+            hint: prof.naming === 'title'
+              ? '把 name 设成确认后的文件名（或直接用 suggested）再调一次，就开始转写'
+              : '这是 bvid 式语料，name 可以省略；想按标题命名就显式传 name',
+            error: meta.ok ? undefined : meta.error,
+          }, null, 2)
+        }
+        return JSON.stringify({
+          ok: false,
+          needName: true,
+          bvid,
+          corpus: prof.id,
+          naming: prof.naming,
+          title: meta.title ?? null,
+          suggested,
+          hint: `「${prof.id}」是标题式语料：请先跟用户确认文件名（建议 ${suggested}），再带 name=<文件名> 重新调用`,
+          error: meta.ok ? undefined : meta.error,
+        }, null, 2)
+      }
+
+      const res = enqueueBili(target, args?.force === true, corpusId, name)
       if (!res.ok) return JSON.stringify({ ok: false, error: res.error }, null, 2)
       if (args?.wait === true) {
         const deadline = Date.now() + 30 * 60 * 1000

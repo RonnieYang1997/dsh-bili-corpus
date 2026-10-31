@@ -159,7 +159,7 @@ type Status = {
 type Corpora = {
   ok?: boolean
   active?: string
-  corpora?: Array<{ id: string; docPrefix?: string; landing?: string; archive?: string }>
+  corpora?: Array<{ id: string; docPrefix?: string; naming?: string; fileName?: string; landing?: string; archive?: string }>
 }
 
 function countOf(v: Count | undefined): string {
@@ -175,9 +175,10 @@ function stateIcon(j: JobBrief): string {
   return '· 排队'
 }
 
-function TranscribeSection(props: { status: Status | null; refresh: () => void }): ReactElement {
-  const { status, refresh } = props
+function TranscribeSection(props: { status: Status | null; refresh: () => void; naming?: string }): ReactElement {
+  const { status, refresh, naming = 'bvid' } = props
   const [target, setTarget] = useState('')
+  const [name, setName] = useState('')
   const [msg, setMsg] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const t = status?.transcribe ?? {}
@@ -193,14 +194,21 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void }
     fetch(`${API}/transcribe`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ target: value }),
+      body: JSON.stringify({ target: value, name: name.trim() || undefined }),
     })
       .then((r) => r.json().then((body: unknown) => ({ ok: r.ok, body })))
       .then(({ ok, body }: { ok: boolean; body: any }) => {
+        // 标题式语料：服务端先不入队，回一个建议名（needName）
+        if (body?.needName === true) {
+          if (body?.suggested) setName(String(body.suggested))
+          setMsg(body?.hint ?? '这是标题式语料，请确认文件名后再点转写')
+          return
+        }
         if (!ok || body?.ok === false) setMsg(`入队失败：${body?.error ?? '未知错误'}`)
         else {
           setMsg(`已入队 ${body?.job?.bvid ?? ''}（${body?.job?.id ?? ''}）`)
           setTarget('')
+          setName('')
         }
       })
       .catch((e: unknown) => setMsg(`请求失败：${String(e)}`))
@@ -208,7 +216,7 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void }
         setBusy(false)
         refresh()
       })
-  }, [target, refresh])
+  }, [target, name, refresh])
 
   const rows: ReactElement[] = []
   rows.push(
@@ -218,6 +226,11 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void }
       v: t.skill?.pythonExists && t.skill?.bridgeExists
         ? `就绪（本地 SenseVoice，已转 ${t.cachedFiles ?? '?'} 篇）`
         : `未就绪（venv=${t.skill?.pythonExists ? '✓' : '✗'} bridge=${t.skill?.bridgeExists ? '✓' : '✗'}）`,
+    }),
+    h(Row, {
+      key: 'naming',
+      k: '命名策略',
+      v: naming === 'title' ? '标题-BV号（转写前需确认文件名）' : 'dufu-BV号',
     }),
     h(Row, {
       key: 'queue',
@@ -263,6 +276,12 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void }
       }),
       h('button', { type: 'button', style: btnStyle, disabled: busy, onClick: submit }, busy ? '入队中…' : '转写'),
     ),
+    h('input', {
+      style: { ...inputStyle, marginBottom: 6 },
+      placeholder: naming === 'title' ? '文件名（标题-BV号.md；留空会先给建议名）' : '文件名（可选，留空用 dufu-BV号.md）',
+      value: name,
+      onChange: (e: any) => setName(String(e?.target?.value ?? '')),
+    }),
     msg ? h('div', { style: { color: msg.startsWith('已入队') ? '#8c8' : '#e88', fontSize: 11 } }, msg) : null,
     h('div', null, rows),
     h(
@@ -276,13 +295,14 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void }
 function CockpitPanel(): ReactElement {
   const [status, setStatus] = useState<Status | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
-  const [corpora, setCorpora] = useState<Array<{ id: string }>>([])
+  type CorpusChip = { id: string; naming?: string; docPrefix?: string }
+  const [corpora, setCorpora] = useState<CorpusChip[]>([])
   const [active, setActive] = useState('')
 
   const refresh = useCallback(async (corpus?: string) => {
     try {
       const c: Corpora = await fetch(`${API}/corpora`, { headers: { accept: 'application/json' } }).then((r) => r.json())
-      setCorpora(Array.isArray(c?.corpora) ? (c.corpora as Array<{ id: string }>) : [])
+      setCorpora(Array.isArray(c?.corpora) ? (c.corpora as CorpusChip[]) : [])
       const want = corpus || active || c?.active || ''
       if (want) setActive(want)
       const url = `${API}/status${want ? `?corpus=${encodeURIComponent(want)}` : ''}`
@@ -397,7 +417,7 @@ function CockpitPanel(): ReactElement {
       : status
         ? h('div', null, rows)
         : h('div', null, '加载中…'),
-    h(TranscribeSection, { status, refresh }),
+    h(TranscribeSection, { status, refresh, naming: corpora.find((c) => c.id === active)?.naming ?? 'bvid' }),
     h(
       'div',
       { style: { display: 'flex', gap: 8, marginTop: 10 } },
