@@ -1,6 +1,6 @@
 # dsh-bili-corpus 泛化改造计划（草案 v1 · 2026-10-30）
 
-> **进度**：P0 已于 2026-10-30 落地（`~/.dsh/corpus/corpora.json` + `corpus_use` + 面板语料 chip + `GET /api/corpora` / `POST /api/corpus` / `GET /api/status?corpus=`）；**P1 已于 2026-10-31 落地**（引擎脚本内嵌 `python/engine/scripts`，bridge 优先内置引擎，ffmpeg/venv/模型搬到 `~/.dsh/speech-to-text/` 侧自动探测；验收方式：把 AionUi 技能目录整个改名后冷跑 `BV1Genn6AEpk` 成功）；**P2a 已于 2026-10-31 落地**（7 个清洗脚本内嵌 `python/pipeline`，`paths.py` 读宿主注入的 `DSH_CORPUS_LANDING/ARCHIVE/STATE/PATCHES/DOC_PREFIX/ASR_RAW`；补丁目录按语料隔离 `<STATE>/_patches/batch-N`；门禁 cwd 改 `python/pipeline`；`demo` 上 dryRun 批次端到端通过）。**P2b 已于 2026-10-31 完成**（旧/新引擎同批补丁对拍：报告与产物 sha256 逐字节一致；demo 真批次批 3 落地 2 篇、门禁 PASS）；**P2c 已于 2026-10-31 完成**（`DSH_CORPUS_ENGINE=legacy` 回滚开关；台账批次记录带 `corpus` 戳）。**P3 命名解耦已于 2026-10-31 落地**（每语料 `naming: bvid|title` + `fileName` 模板；`bili_transcribe {propose:true}` 取建议名、`name` 落盘；标题式语料缺 name 回 `needName` 不入队；面板出现「命名策略」行与文件名输入框；存档同 bvid 不同名不重复归档；`corpus_lint.py` 改为「文件名带 BV 号即算稿」并同步修 selftest fixture）。**P3 面板语料管理已于 2026-10-31 落地**（`corpus_manage` create/update/delete + `POST /api/corpora/{create,update,delete}` + 面板「管理」视图；删除护栏：内置/生效/有稿件拒绝，只删配置保留目录；curl 与工具两条路径均验收）。P3 剩余：本地文件入口（file 适配器）。
+> **进度**：P0 已于 2026-10-30 落地（`~/.dsh/corpus/corpora.json` + `corpus_use` + 面板语料 chip + `GET /api/corpora` / `POST /api/corpus` / `GET /api/status?corpus=`）；**P1 已于 2026-10-31 落地**（引擎脚本内嵌 `python/engine/scripts`，bridge 优先内置引擎，ffmpeg/venv/模型搬到 `~/.dsh/speech-to-text/` 侧自动探测；验收方式：把 AionUi 技能目录整个改名后冷跑 `BV1Genn6AEpk` 成功）；**P2a 已于 2026-10-31 落地**（7 个清洗脚本内嵌 `python/pipeline`，`paths.py` 读宿主注入的 `DSH_CORPUS_LANDING/ARCHIVE/STATE/PATCHES/DOC_PREFIX/ASR_RAW`；补丁目录按语料隔离 `<STATE>/_patches/batch-N`；门禁 cwd 改 `python/pipeline`；`demo` 上 dryRun 批次端到端通过）。**P2b 已于 2026-10-31 完成**（旧/新引擎同批补丁对拍：报告与产物 sha256 逐字节一致；demo 真批次批 3 落地 2 篇、门禁 PASS）；**P2c 已于 2026-10-31 完成**（`DSH_CORPUS_ENGINE=legacy` 回滚开关；台账批次记录带 `corpus` 戳）。**P3 命名解耦已于 2026-10-31 落地**（每语料 `naming: bvid|title` + `fileName` 模板；`bili_transcribe {propose:true}` 取建议名、`name` 落盘；标题式语料缺 name 回 `needName` 不入队；面板出现「命名策略」行与文件名输入框；存档同 bvid 不同名不重复归档；`corpus_lint.py` 改为「文件名带 BV 号即算稿」并同步修 selftest fixture）。**P3 面板语料管理已于 2026-10-31 落地**（`corpus_manage` create/update/delete + `POST /api/corpora/{create,update,delete}` + 面板「管理」视图；删除护栏：内置/生效/有稿件拒绝，只删配置保留目录；curl 与工具两条路径均验收）。P3 剩余：本地文件入口（file 适配器）——**用户 2026-10-31 决定暂不做**（m03007「本地音频暂时不做」），保留为 P4 可选项。
 
 > 目标：从「独夫之心专用」变成「任意音频 → 转写稿」+「任意文本语料 → LLM 校对 / 标点恢复 / 门禁」的通用插件。
 > 本文只是计划，不含实现；每个阶段都可独立交付、独立回滚。
@@ -112,7 +112,7 @@ glob 规则：`docPrefix` 参与扫描（`^<prefix>.+\.md$`），索引行形模
   `dufuzhixin` 的 `corpus_gates` 从 pipeline 跑 1.7 s 通过；落点/存档 sha 未变、无串库写入。
 - **P2b（2026-10-31 已完成）**：见附录 B。
 - **P2c（2026-10-31 已完成）**：回滚开关 = env `DSH_CORPUS_ENGINE=legacy`（批次链路改走 `_scratch` 旧脚本，其余不受影响；旧脚本路径写死 dufuzhixin，故只对 dufuzhixin 有意义）。`ledger` 的 `corpus` 字段取舍：**加**——宿主自动传 `DSH_CORPUS_ID`，`smoothing_batch.py record` 写进批次记录；每语料本就有独立 `STATE`，所以只作排查用的戳，不参与路径计算，老台账无该字段也照常读。
-- 仍待：P3 本地文件转写入口（file 适配器）。
+- 暂缓（用户 2026-10-31 决定）：P3 本地文件转写入口（file 适配器），需要时再开。
 
 原计划（P2b/P2c 仍适用）：
 - 迁移：`smoothing_batch.py`、`apply_smoothing.py`、`punct_local.py`、`punct_apply.py`、`punct_queue.py`、`corpus_lint.py`、`corpus_lint_selftest.py` → `python/pipeline/`。
@@ -130,7 +130,7 @@ glob 规则：`docPrefix` 参与扫描（`^<prefix>.+\.md$`），索引行形模
 - ✅ 转写任务台账带 `corpus`；`bili_jobs` 只列当前语料（`jobsOf()` 过滤）。
 - ✅ 命名策略 `naming: bvid|title` + `propose`/`name` 两步确认（2026-10-31）。
 - ✅ 面板语料管理（新建/编辑/删除语料；`corpus_manage` 与面板「管理」同路径，删除有护栏）。
-- ⬜ 新增「本地音频文件」入口（`file` 适配器）：选文件 → 转写 → 进当前 corpus 落点/存档。
+- ⏸ 新增「本地音频文件」入口（`file` 适配器）：选文件 → 转写 → 进当前 corpus 落点/存档（2026-10-31 用户决定暂不做）。
 
 ## 5. 兼容与迁移
 
