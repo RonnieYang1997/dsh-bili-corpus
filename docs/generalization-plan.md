@@ -1,6 +1,6 @@
 # dsh-bili-corpus 泛化改造计划（草案 v1 · 2026-10-30）
 
-> **进度**：P0 已于 2026-10-30 落地（`~/.dsh/corpus/corpora.json` + `corpus_use` + 面板语料 chip + `GET /api/corpora` / `POST /api/corpus` / `GET /api/status?corpus=`）；**P1 已于 2026-10-31 落地**（引擎脚本内嵌 `python/engine/scripts`，bridge 优先内置引擎，ffmpeg/venv/模型搬到 `~/.dsh/speech-to-text/` 侧自动探测；验收方式：把 AionUi 技能目录整个改名后冷跑 `BV1Genn6AEpk` 成功）。P2/P3 未动。
+> **进度**：P0 已于 2026-10-30 落地（`~/.dsh/corpus/corpora.json` + `corpus_use` + 面板语料 chip + `GET /api/corpora` / `POST /api/corpus` / `GET /api/status?corpus=`）；**P1 已于 2026-10-31 落地**（引擎脚本内嵌 `python/engine/scripts`，bridge 优先内置引擎，ffmpeg/venv/模型搬到 `~/.dsh/speech-to-text/` 侧自动探测；验收方式：把 AionUi 技能目录整个改名后冷跑 `BV1Genn6AEpk` 成功）；**P2a 已于 2026-10-31 落地**（7 个清洗脚本内嵌 `python/pipeline`，`paths.py` 读宿主注入的 `DSH_CORPUS_LANDING/ARCHIVE/STATE/PATCHES/DOC_PREFIX/ASR_RAW`；补丁目录按语料隔离 `<STATE>/_patches/batch-N`；门禁 cwd 改 `python/pipeline`；`demo` 上 dryRun 批次端到端通过）。P2b/P2c、P3 未动。
 
 > 目标：从「独夫之心专用」变成「任意音频 → 转写稿」+「任意文本语料 → LLM 校对 / 标点恢复 / 门禁」的通用插件。
 > 本文只是计划，不含实现；每个阶段都可独立交付、独立回滚。
@@ -102,6 +102,17 @@ glob 规则：`docPrefix` 参与扫描（`^<prefix>.+\.md$`），索引行形模
 
 ### P2 清洗引擎内嵌（2–3 天，最重）
 
+**P2a 已完成（2026-10-31）**，与下面原计划的差异：
+- ✅ 7 个脚本已进 `python/pipeline/`；新增 `paths.py`（`LANDING/ARCHIVE/STATE/PATCHES/DOC_PREFIX/ASR_RAW`，env 注入，缺省回落 dufuzhixin）。
+- ⚠️ 没有改用 `--corpus-root` 之类 CLI 参数，而是**宿主给子进程注入 env**：脚本内 `import corpus_paths as _cp` 全部改成 `import paths as _cp`，改动面最小、旧调用形态不变。
+- ✅ 补丁目录按语料隔离：`<STATE>/_patches/batch-N`（旧批在 `_scratch/_patches`，属历史）。
+- ✅ 门禁从「技能目录的 `corpus_lint.py`」改成「`python/pipeline/corpus_lint.py`」，cwd 也改 pipeline；默认单根（存档）+ baseline（`DSH_CORPUS_LINT_BASELINE` 由宿主传）。
+- ✅ 顺手修掉宿主给 `apply_smoothing.py` 传 `--guard` 的老 bug（现版只认 `--snap`）。
+- 验收（dryRun）：`demo` 语料上 `queue 4 篇 → 补丁 10 → apply(dry) 2 篇 → record 跳过 → 门禁 PASS`；
+  `dufuzhixin` 的 `corpus_gates` 从 pipeline 跑 1.7 s 通过；落点/存档 sha 未变、无串库写入。
+- 未做（P2b/P2c）：demo/副本的真批次对拍、`ledger` 加 `corpus` 字段、cutover 与 `legacy/` 回滚开关；`corpus_lint.py` 规则仍写死 `dufu-BV*.md`。
+
+原计划（P2b/P2c 仍适用）：
 - 迁移：`smoothing_batch.py`、`apply_smoothing.py`、`punct_local.py`、`punct_apply.py`、`punct_queue.py`、`corpus_lint.py`、`corpus_lint_selftest.py` → `python/pipeline/`。
 - 去掉脚本内部写死：`MIR`、`MAIN`、`MAIN_ROOTS`、`corpus_paths` 依赖；统一 `--corpus-root`/`--archive`/`--state` 参数（插件注入）。
 - 台账：`ledger.json` 增加 `corpus`/`version` 字段；旧格式只读兼容，新写入自动补字段。

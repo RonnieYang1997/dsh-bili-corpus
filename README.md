@@ -6,7 +6,7 @@ B 站视频转写 + 语料「文意疏通」一体化驾驶舱。一个插件、
  转写线    BVID / 视频链接 / 整段分享文案
              │  bili_transcribe（单并发队列）
              ▼
-           python/bridge.py ──import──▶ bilibili-transcribe 技能
+           python/bridge.py ──import──▶ python/engine/scripts（内置转写引擎，P1）
              │  (进程内调用，不产生新会话)
              ▼
            WBI 签名下载 DASH → 本地 SenseVoice → 落点 memory/dufu-<bvid>.md
@@ -16,10 +16,10 @@ B 站视频转写 + 语料「文意疏通」一体化驾驶舱。一个插件、
  清洗线    dufu-*.md
              │  corpus_batch（错字通道 24 篇/批，LLM 逐篇出补丁）
              ▼
-           逐篇 LLM → verify（专名校验）→ apply_smoothing.py --drop-bad --guard
-             │  punct 通道走本地 punct_apply.py（0 token）
+           逐篇 LLM → verify（专名校验）→ python/pipeline/apply_smoothing.py --drop-bad --snap
+             │  punct 通道走原生本地模型 punct_local.py + punct_apply.py（0 token）
              ▼
-           记录台账 → 门禁（corpus_lint.py + selftest）→ 通过才允许下一批
+           记录台账 → 门禁（python/pipeline/corpus_lint.py + selftest）→ 通过才允许下一批
 ```
 
 面板（`conversation.view`，标签「B站语料」）上半区是转写，下半区是清洗进度。
@@ -75,7 +75,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 
 ## 状态与产物路径
 
-三处目录的分工（与 `_scratch/corpus_paths.py` 对齐）：
+三处目录的分工（与插件内 `python/pipeline/paths.py` 对齐；旧的 `_scratch/` 只是历史脚本目录）：
 
 | 角色 | 路径 | 说明 |
 | --- | --- | --- |
@@ -87,8 +87,8 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 「落点 + 存档」两副本工作，所以插件在**开批前**会把存档里有、落点里没有的稿自动补进落点
 （批次结果里的 `hydrated` / `missingDocs` 字段），脚本一行不用改。
 
-**标点通道的旧稿**：已落地 2277/3755，剩下的 1400+ 篇只在存档里 —— 清洗脚本的 queue 只扫
-「落点 + 旧主库」，所以要先 `corpus_hydrate` 把存档稿补回落点，再跑 `punct_queue.py` 出波，
+**标点通道的旧稿**：已落地 2277 篇，剩下的稿子大多只在存档里 —— 开批前插件会自动
+`corpus_hydrate` 把存档稿补回落点（P2a 起 queue 扫的是「落点 + 存档」两副本），
 之后 `corpus_batch {kind:'punct'}` 才有活干（面板的「标点通道」进度就是这么读的）。
 
 | 路径 | 内容 |
@@ -113,6 +113,8 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `DSH_CORPUS_CONFIG` | 多语料配置文件，默认 `~/.dsh/corpus/corpora.json`（P0 起语料从这里来） |
 | `DSH_CORPUS_ACTIVE` | 首次启动时的默认语料 id（之后以 `~/.dsh/corpus/active-corpus.json` 为准） |
 | `DSH_CORPUS_STATE` / `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_LINT_DIR` | 单语料 env 兜底（不写 corpora.json 时生效；旧名 `DSH_CORPUS_MIRROR` 仍是 ARCHIVE 别名） |
+| `DSH_CORPUS_PIPELINE` | 清洗脚本目录，默认插件内 `python/pipeline`（P2a 起不用 `_scratch`） |
+| `DSH_CORPUS_PATCHES` | 补丁根，默认 `<STATE>/_patches`；由宿主自动传给 python 子进程 |
 | `DSH_CORPUS_AUTO` | `false`（不自动跑批） |
 
 ## 转写引擎（P1：已内嵌，2026-10-31）
@@ -159,10 +161,21 @@ node scripts/smoke-second-corpus.mjs --id demo --transcribe BV112uU6BEQM   # 顺
 `corpus_status` 两库计数、`corpus_hydrate`、`corpus_mirror_sync`、`corpus_gates`（每语料独立
 `lint-baseline-archive.json`）、暂停/恢复。
 
-**仍绑 dufuzhixin 的是清洗引擎（P2 才解）**：`_scratch/corpus_paths.py` 把
-`MAIN/LEGACY_MAIN/MIRROR/STATE` 写成 dufuzhixin 常量；`apply_smoothing.py` / `punct_apply.py`
-各自把 `MIR` 写死；`corpus_lint.py` 的 `assert_corpus_root(min_transcripts=1000)` 会拒绝小语料。
-所以在 demo 上**不要**跑 `corpus_batch` —— 它会读/写 dufuzhixin 的批次与状态。
+**清洗引擎（P2a：已内嵌，2026-10-31）**：`smoothing_batch.py` / `apply_smoothing.py` /
+`punct_apply.py` / `punct_queue.py` / `punct_local.py` / `corpus_lint.py` /
+`corpus_lint_selftest.py` 全部复制进 `python/pipeline/`；路径由 `python/pipeline/paths.py`
+从宿主注入的环境变量读取（`DSH_CORPUS_LANDING / ARCHIVE / STATE / PATCHES / DOC_PREFIX / ASR_RAW`），
+不再依赖 `_scratch/` 和 AionUi 技能目录（宿主跑脚本时 `cwd` 也是 `python/pipeline`）。
+补丁目录改为**按语料隔离**：`<STATE>/_patches/batch-N`（旧批次的补丁仍在
+`default-workspace/_scratch/_patches`，属于历史）。
+门禁默认 `cwd` 也是 `python/pipeline`（`DSH_CORPUS_LINT_DIR` 仍可覆盖；lint 默认只判存档单根）。
+
+当前 demo 上可以真跑 `corpus_batch`（dryRun 实测通过：queue 4 篇 → 补丁 10 → apply(dry) 2 篇 → 门禁 PASS；
+真写只影响 demo 语料）。
+
+仍待做（P2b/P2c）：demo 副本真批次对拍、切换成「每语料独立引擎配置」的正式形态。
+注意：`corpus_lint.py` 的规则仍按 `dufu-BV*.md` 命名写死（`docPrefix` 只影响读写与索引），
+换非 `dufu-` 前缀的语料要先改 lint 规则。
 
 ## 已知坑（都是踩过的）
 
@@ -180,6 +193,10 @@ node scripts/smoke-second-corpus.mjs --id demo --transcribe BV112uU6BEQM   # 顺
 6. 注入器自重载用 `dev_reload_package`；注入器自身的 entry 没有 `_dispose`，走 `entry.fiber.dispose()`。
 7. **ASR 子进程靠 `SENSEVOICE_FFMPEG` 环境变量找 ffmpeg**：bridge 解析出 ffmpeg 后会写进子进程 env，
    只给 `bt.FFMPEG` 不够（`sensevoice_asr.py` 是独立 CLI）。2026-10-31 内置引擎实测时踩过。
+8. **别给 `apply_smoothing.py` 传 `--guard`**：现版只有 `--snap`（写入前逐篇核对 sha），
+   多传 `--guard` 会 argparse 报 `unrecognized arguments`（2026-10-31 演示批实测，已从宿主调用里去掉）。
+9. **清洗脚本的常量是"旧世界"口径**：`smoothing_batch.py` 里 `STATE = _cp.STATE` 之类必须在 env 里
+   给全（`DSH_CORPUS_STATE/PATCHES`），否则会退回 dufuzhixin 的默认路径 → 串库写入。
 
 ## 冒烟
 

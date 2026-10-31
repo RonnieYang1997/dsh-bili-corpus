@@ -47,7 +47,8 @@ interface PluginContext {
 const E = process.env
 const HOME = homedir().replace(/\\/g, '/')
 const WORKSPACE = E.DSH_CORPUS_WORKSPACE || 'C:/Users/Ronnie/Documents/deepseek-harness/default-workspace'
-const SCRATCH = E.DSH_CORPUS_SCRATCH || join(WORKSPACE, '_scratch')
+// P2a：清洗管线内嵌进插件（python/pipeline），不再依赖外部 _scratch / 技能目录。
+const PIPELINE = E.DSH_CORPUS_PIPELINE || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'pipeline')
 
 /** 多语料配置：一份 JSON 描述若干 corpus；改它 + 重载插件即可加语料（env 仍作兼容兜底）。 */
 const CORPORA_FILE = E.DSH_CORPUS_CONFIG || join(HOME, '.dsh', 'corpus', 'corpora.json')
@@ -72,7 +73,7 @@ const ENGINE = {
   python: E.DSH_CORPUS_PY || 'C:/Users/Ronnie/AppData/Local/Programs/Python/Python312/python.exe',
   pythonAsr: E.DSH_CORPUS_ASR_PY
     || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/.venv/Scripts/python.exe',
-  lintDir: E.DSH_CORPUS_LINT_DIR
+  lintDir: E.DSH_CORPUS_LINT_DIR || PIPELINE
     || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/scripts',
 }
 
@@ -238,10 +239,10 @@ const BILI_FFMPEG = E.DSH_BILI_FFMPEG
 const BILI_FFPROBE = E.DSH_BILI_FFPROBE || BILI_FFMPEG.replace('ffmpeg.exe', 'ffprobe.exe')
 const BILI_MODEL_FILE = join(BILI_MODEL_DIR, 'model.int8.onnx')
 
-const BATCH_SCRIPT = join(SCRATCH, 'smoothing_batch.py')
-const APPLY_SCRIPT = join(SCRATCH, 'apply_smoothing.py')
-const PUNCT_LOCAL = join(SCRATCH, 'punct_local.py')
-const PUNCT_APPLY = join(SCRATCH, 'punct_apply.py')
+const BATCH_SCRIPT = join(PIPELINE, 'smoothing_batch.py')
+const APPLY_SCRIPT = join(PIPELINE, 'apply_smoothing.py')
+const PUNCT_LOCAL = join(PIPELINE, 'punct_local.py')
+const PUNCT_APPLY = join(PIPELINE, 'punct_apply.py')
 // 与 _scratch/smoothing_batch.py 的 DONE_STATUS 对齐（2026-10-13）：
 // 'skip' 是"代理读过、判定无需改动但落地时报补丁为空"的稿子——它同样算走完一遍，
 // 否则驾驶舱的 docsDone 永远差 14 篇到不了 3747（UI 上会显示"未完成"）。
@@ -304,7 +305,19 @@ function run(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: numb
     timeout: opts.timeoutMs ?? 600000,
     maxBuffer: 128 * 1024 * 1024,
     windowsHide: true,
-    env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: 'utf-8',
+      PYTHONUTF8: '1',
+      // P2a：pipeline 脚本靠这些变量定位语料（paths.py），不用再写死路径。
+      DSH_CORPUS_LANDING: P().landing,
+      DSH_CORPUS_ARCHIVE: P().archive,
+      DSH_CORPUS_STATE: P().state,
+      DSH_CORPUS_PATCHES: join(P().state, '_patches'),
+      DSH_CORPUS_DOC_PREFIX: P().docPrefix,
+      DSH_CORPUS_ASR_RAW: join(dirname(P().state), '_asr_raw'),
+      DSH_CORPUS_LINT_BASELINE: lintBaseline(),
+    },
   })
   const out = String(r.stdout ?? '') + String(r.stderr ?? '')
   return { rc: r.status ?? -1, out, error: r.error ? String(r.error.message) : null, ms: Date.now() - started }
@@ -800,7 +813,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     try {
       await verifyNames(bvid, body, patches)
     } catch { /* 核实只是加分项，绝不阻断 */ }
-    const dir = join(SCRATCH, '_patches', `batch-${batchNo}`)
+    const dir = join(P().state, '_patches', `batch-${batchNo}`)
     ensureDir(dir)
     writeJson(join(dir, `${bvid}.json`), {
       bvid,
@@ -828,7 +841,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const batchNo = Number.isFinite(opts.batch as number) ? Number(opts.batch) : maxN + 1
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'queue', startedAt: nowIso() }
-    const q = run(P().python, [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)], { cwd: SCRATCH, timeoutMs: 300000 })
+    const q = run(P().python, [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)], { cwd: PIPELINE, timeoutMs: 300000 })
     if (q.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'queue', error: `queue rc=${q.rc}`, tail: tail(q.out) }
     }
@@ -837,7 +850,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     // 旧主库已退役：清洗脚本按「落点 + 存档」两副本工作，缺的从存档补进落点。
     const hyd = hydrateDocs(queue.map((x) => String(x.bvid)))
     if (hyd.copied > 0) log(`批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
-    const snap = run(P().python, [BATCH_SCRIPT, 'snapshot', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 600000 })
+    const snap = run(P().python, [BATCH_SCRIPT, 'snapshot', '--batch', String(batchNo)], { cwd: PIPELINE, timeoutMs: 600000 })
     if (snap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'snapshot', error: `snapshot rc=${snap.rc}`, tail: tail(snap.out) }
     }
@@ -855,7 +868,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'verify', startedAt: nowIso() }
-    const ver = run(P().python, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 900000 })
+    const ver = run(P().python, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: PIPELINE, timeoutMs: 900000 })
     if (ver.rc !== 0) {
       return {
         ok: false, batch: batchNo, kind: 'error', phase: 'verify', status: 'FAILED',
@@ -865,22 +878,24 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'apply', startedAt: nowIso() }
-    const patchDir = join(SCRATCH, '_patches', `batch-${batchNo}`)
+    const patchDir = join(P().state, '_patches', `batch-${batchNo}`)
     const reportFile = join(P().state, `report-batch-${batchNo}.json`)
     const applyArgs = [
       APPLY_SCRIPT, '--dir', patchDir,
       '--snap', join(P().state, `snap-batch-${batchNo}.json`),
       '--report', reportFile,
-      '--drop-bad', '--guard',
+      // --guard 是旧版 apply_smoothing.py 的参数；现版只有 --snap（写入前逐篇核对 sha），
+      // 再传 --guard 会 argparse 报 unrecognized（2026-10-31 演示批实测）。
+      '--drop-bad',
     ]
     if (opts.dryRun) applyArgs.push('--dry-run')
-    const ap = run(P().python, applyArgs, { cwd: SCRATCH, timeoutMs: 900000 })
+    const ap = run(P().python, applyArgs, { cwd: PIPELINE, timeoutMs: 900000 })
     if (ap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'apply', status: 'FAILED', error: `apply rc=${ap.rc}`, tail: tail(ap.out) }
     }
     const report = readJson<Record<string, any>>(reportFile, {})
     if (!opts.dryRun) {
-      const rec = run(P().python, [BATCH_SCRIPT, 'record', '--batch', String(batchNo)], { cwd: SCRATCH, timeoutMs: 300000 })
+      const rec = run(P().python, [BATCH_SCRIPT, 'record', '--batch', String(batchNo)], { cwd: PIPELINE, timeoutMs: 300000 })
       if (rec.rc !== 0) {
         return { ok: false, batch: batchNo, kind: 'error', phase: 'record', status: 'FAILED', error: `record rc=${rec.rc}`, tail: tail(rec.out) }
       }
@@ -949,7 +964,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     if (hyd.copied > 0) log(`punct 批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
     inFlight = { kind: 'punct', batch: batchNo, phase: 'local-model', startedAt: nowIso() }
     const local = run(P().pythonAsr, [PUNCT_LOCAL, '--batch', String(batchNo)], {
-      cwd: SCRATCH,
+      cwd: PIPELINE,
       timeoutMs: Number(E.DSH_CORPUS_PUNCT_TIMEOUT_MS || 4 * 3600 * 1000),
     })
     if (local.rc !== 0) {
@@ -958,7 +973,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     inFlight = { kind: 'punct', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const applyArgs = [PUNCT_APPLY, '--batch', String(batchNo)]
     if (opts.dryRun) applyArgs.push('--dry-run')
-    const ap = run(P().python, applyArgs, { cwd: SCRATCH, timeoutMs: 1800000 })
+    const ap = run(P().python, applyArgs, { cwd: PIPELINE, timeoutMs: 1800000 })
     if (ap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'punct', phase: 'apply', status: 'FAILED', error: `punct_apply rc=${ap.rc}`, tail: tail(ap.out) }
     }
@@ -1601,7 +1616,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   register({
     name: 'corpus_batch',
-    description: '⚠️ 会真改语料（经既有 apply_smoothing.py / punct_apply.py 两条通道落地）。跑一个批次：queue→snapshot→逐篇 LLM→verify→apply(--drop-bad --guard)→record→门禁。kind=error 走错字通道（size 默认 24），kind=punct 走本地标点模型（0 token）。同一时刻只允许一个批次；门禁失败会拒绝开下一批。返回 JSON。',
+    description: '⚠️ 会真改语料（经既有 apply_smoothing.py / punct_apply.py 两条通道落地）。跑一个批次：queue→snapshot→逐篇 LLM→verify→apply(--drop-bad --snap)→record→门禁。kind=error 走错字通道（size 默认 24），kind=punct 走本地标点模型（0 token）。同一时刻只允许一个批次；门禁失败会拒绝开下一批。返回 JSON。',
     parameters: {
       type: 'object',
       properties: {
