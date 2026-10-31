@@ -195,6 +195,163 @@ function corporaSummary(): Record<string, unknown> {
   }
 }
 
+// ───────────────────────── 语料管理（P3-B：面板/工具可新建·编辑·删除） ─────────────────────────
+
+/** 语料 id 规则：小写字母/数字开头，允许 -_，1–32 位。 */
+const CORPUS_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
+
+type CorpusDraft = {
+  id: string
+  naming?: string
+  docPrefix?: string
+  indexFile?: string
+  landing?: string
+  archive?: string
+  state?: string
+}
+
+function isAbsolutePath(p: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\') || p.startsWith('/')
+}
+
+/** 路径比较用（Windows 大小写与分隔符不敏感）。 */
+function samePath(a: string, b: string): boolean {
+  const norm = (x: string): string => x.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+  return !!a && !!b && norm(a) === norm(b)
+}
+
+/** 目录里带 BV 号的稿件数（命名两种模式都认）。 */
+function countTranscripts(dir: string): number {
+  let n = 0
+  try {
+    for (const f of readdirSync(dir)) if (String(f).endsWith('.md') && BV_TOKEN.test(String(f))) n += 1
+  } catch { /* 目录不存在视为 0 */ }
+  return n
+}
+
+function readCorporaEntries(): Record<string, Record<string, string>> {
+  const cfg = readJsonFile<Record<string, any>>(CORPORA_FILE, {})
+  const raw = (cfg && typeof cfg.corpora === 'object' && cfg.corpora) || {}
+  const out: Record<string, Record<string, string>> = {}
+  for (const [id, v] of Object.entries<any>(raw)) {
+    if (!v || typeof v !== 'object') continue
+    out[id] = Object.fromEntries(Object.entries(v).filter(([, x]) => typeof x === 'string' && x)) as Record<string, string>
+  }
+  return out
+}
+
+/** 写回 corpora.json 并重载 profile（保留文件里其它顶层字段，如 default）。 */
+function persistCorpora(entries: Record<string, Record<string, string>>): void {
+  const cur = readJsonFile<Record<string, any>>(CORPORA_FILE, {})
+  const next = { ...cur, default: cur.default || ACTIVE_ID, corpora: entries }
+  ensureDir(dirname(CORPORA_FILE))
+  writeFileSync(CORPORA_FILE, `${JSON.stringify(next, null, 2)}\n`)
+  PROFILES = null
+  loadProfiles()
+}
+
+function corpusPathConflict(landing: string, archive: string, state: string, exceptId?: string): string | null {
+  if (!PROFILES) loadProfiles()
+  for (const p of Object.values(PROFILES as Record<string, CorpusProfile>)) {
+    if (exceptId && p.id === exceptId) continue
+    if (samePath(p.landing, landing) || samePath(p.archive, archive) || samePath(p.state, state)) return `路径与语料 ${p.id} 冲突`
+  }
+  return null
+}
+
+/** 新建语料：建目录 + 空索引文件 + 落配置。落点/状态缺省按 ~/.dsh/corpus/<id>/ 推导。 */
+function createCorpus(d: CorpusDraft): Record<string, unknown> {
+  const id = String(d.id || '').trim().toLowerCase()
+  if (!CORPUS_ID_RE.test(id)) return { ok: false, error: 'id 只允许小写字母/数字/-/_，以字母数字开头，1–32 位' }
+  if (!PROFILES) loadProfiles()
+  if ((PROFILES as Record<string, CorpusProfile>)[id]) return { ok: false, error: `语料 ${id} 已存在` }
+  const archive = String(d.archive || '').trim()
+  if (!archive) return { ok: false, error: '产物存档路径（archive）必填' }
+  const rootDir = join(HOME, '.dsh', 'corpus', id)
+  const landing = String(d.landing || '').trim() || join(rootDir, 'memory')
+  const state = String(d.state || '').trim() || join(rootDir, '_smoothing_state')
+  const paths: Array<[string, string]> = [['landing', landing], ['archive', archive], ['state', state]]
+  for (const [k, v] of paths) if (!isAbsolutePath(v)) return { ok: false, error: `${k} 必须是绝对路径：${v}` }
+  const conflict = corpusPathConflict(landing, archive, state)
+  if (conflict) return { ok: false, error: conflict }
+  const indexFile = String(d.indexFile ?? 'MEMORY.md').trim()
+  ensureDir(landing)
+  ensureDir(archive)
+  ensureDir(state)
+  if (indexFile) {
+    const idx = join(archive, indexFile)
+    if (!existsSync(idx)) writeFileSync(idx, '')
+  }
+  const entries = readCorporaEntries()
+  entries[id] = {
+    docPrefix: String(d.docPrefix || 'dufu-').trim() || 'dufu-',
+    naming: d.naming === 'title' ? 'title' : 'bvid',
+    indexFile,
+    landing,
+    archive,
+    state,
+  }
+  persistCorpora(entries)
+  logLine(`新建语料 ${id}：落点 ${landing} · 存档 ${archive}`)
+  return { ok: true, created: id, ...corporaSummary() }
+}
+
+/** 编辑语料（id 不可改）：只落非空字段；目录不存在会自动补建。 */
+function updateCorpus(d: CorpusDraft): Record<string, unknown> {
+  const id = String(d.id || '').trim()
+  if (!id) return { ok: false, error: '缺少 id' }
+  if (!PROFILES) loadProfiles()
+  const map = PROFILES as Record<string, CorpusProfile>
+  if (!map[id]) return { ok: false, error: `未知语料：${id}` }
+  const entries = readCorporaEntries()
+  if (!entries[id]) {
+    const p = map[id]
+    entries[id] = { docPrefix: p.docPrefix, naming: p.naming, indexFile: p.indexFile, landing: p.landing, archive: p.archive, state: p.state }
+  }
+  const cur = entries[id]
+  const next = { ...cur }
+  if (d.naming !== undefined) next.naming = d.naming === 'title' ? 'title' : 'bvid'
+  if (d.docPrefix !== undefined) next.docPrefix = String(d.docPrefix).trim() || cur.docPrefix || 'dufu-'
+  if (d.indexFile !== undefined) next.indexFile = String(d.indexFile).trim()
+  for (const k of ['landing', 'archive', 'state'] as const) {
+    const v = d[k]
+    if (v === undefined || !String(v).trim()) continue
+    const val = String(v).trim()
+    if (!isAbsolutePath(val)) return { ok: false, error: `${k} 必须是绝对路径：${val}` }
+    next[k] = val
+  }
+  const conflict = corpusPathConflict(next.landing, next.archive, next.state, id)
+  if (conflict) return { ok: false, error: conflict }
+  ensureDir(next.landing)
+  ensureDir(next.archive)
+  ensureDir(next.state)
+  if (next.indexFile && !existsSync(join(next.archive, next.indexFile))) writeFileSync(join(next.archive, next.indexFile), '')
+  entries[id] = next
+  persistCorpora(entries)
+  logLine(`更新语料 ${id}：${JSON.stringify(next)}`)
+  return { ok: true, updated: id, ...corporaSummary() }
+}
+
+/** 删除语料：内置语料/生效语料不可删；目录里有稿件则拒绝（只删配置，目录保留）。 */
+function deleteCorpus(id: string): Record<string, unknown> {
+  const cid = String(id || '').trim()
+  if (!cid) return { ok: false, error: '缺少 id' }
+  if (!PROFILES) loadProfiles()
+  const map = PROFILES as Record<string, CorpusProfile>
+  const p = map[cid]
+  if (!p) return { ok: false, error: `未知语料：${cid}` }
+  if (cid === envProfile().id) return { ok: false, error: `内置语料 ${cid} 不能删除` }
+  if (cid === ACTIVE_ID) return { ok: false, error: `语料 ${cid} 正在生效，先用 corpus_use 切到别的语料再删` }
+  const landing = countTranscripts(p.landing)
+  const archive = countTranscripts(p.archive)
+  if (landing + archive > 0) return { ok: false, error: `语料 ${cid} 还有 ${landing + archive} 篇稿（落点 ${landing} · 存档 ${archive}），先清空或迁走再删` }
+  const entries = readCorporaEntries()
+  delete entries[cid]
+  persistCorpora(entries)
+  logLine(`删除语料 ${cid}（目录保留：${p.landing} / ${p.archive}）`)
+  return { ok: true, deleted: cid, keptDirs: [p.landing, p.archive, p.state], ...corporaSummary() }
+}
+
 const BV_TOKEN = /BV[0-9A-Za-z]{10}/
 
 /** 标题 → 安全文件名片段：去非法字符、空白压成连字符、限长 60（保留中文）。 */
@@ -322,6 +479,11 @@ export const SYSTEM_PROMPT = `你是中文语音转写稿的校对员，任务�
 没有发现问题就输出 {"bvid":"<给定 bvid>","patches":[]}`
 
 // ───────────────────────────────────────────────────────────────── 小工具
+/** 模块级日志兜底（apply 内部的 log 在语料管理函数里不可见）。 */
+function logLine(msg: string): void {
+  try { console.log(`[dsh-bili-corpus] ${msg}`) } catch { /* ignore */ }
+}
+
 function nowIso(): string {
   return new Date().toISOString()
 }
@@ -1424,6 +1586,50 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   })
 
   register({
+    name: 'corpus_manage',
+    description: '新建/编辑/删除语料（写 corpora.json；新建会建落点/存档/状态目录并写空索引文件）。delete 只允许删除「目录里没有带 BV 号稿件」的非生效语料，需 confirm=true。批次/转写在跑时拒绝。返回 JSON。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'delete'], description: 'create=新建，update=编辑，delete=删除' },
+        id: { type: 'string', description: '语料 id（小写字母/数字/-/_，1–32 位；update/delete 必填）' },
+        naming: { type: 'string', enum: ['bvid', 'title'], description: '命名策略：bvid=`dufu-<bvid>.md`；title=`<标题>-<bvid>.md`' },
+        docPrefix: { type: 'string', description: 'bvid 模式的文件名前缀（默认 dufu-）' },
+        indexFile: { type: 'string', description: '索引文件名（默认 MEMORY.md；空串 = 不维护索引）' },
+        landing: { type: 'string', description: '新稿落点目录（绝对路径；缺省 ~/.dsh/corpus/<id>/memory）' },
+        archive: { type: 'string', description: '产物存档目录（绝对路径，create 必填）' },
+        state: { type: 'string', description: '状态目录（绝对路径；缺省 ~/.dsh/corpus/<id>/_smoothing_state）' },
+        confirm: { type: 'boolean', description: 'delete 必须为 true' },
+      },
+      required: ['action'],
+    },
+    output: textOutput,
+    async execute(args: Record<string, unknown>) {
+      const action = String(args?.action ?? '').trim()
+      if (inFlight) return JSON.stringify({ ok: false, error: 'BUSY', message: `批次在跑（${inFlight}），跑完再改语料` }, null, 2)
+      if (biliBusy) return JSON.stringify({ ok: false, error: 'BUSY', message: `转写任务在跑（${biliBusy.id}），跑完再改语料` }, null, 2)
+      const draft: CorpusDraft = {
+        id: String(args?.id ?? ''),
+        naming: args?.naming === undefined ? undefined : String(args.naming),
+        docPrefix: args?.docPrefix === undefined ? undefined : String(args.docPrefix),
+        indexFile: args?.indexFile === undefined ? undefined : String(args.indexFile),
+        landing: args?.landing === undefined ? undefined : String(args.landing),
+        archive: args?.archive === undefined ? undefined : String(args.archive),
+        state: args?.state === undefined ? undefined : String(args.state),
+      }
+      let r: Record<string, unknown>
+      if (action === 'create') r = createCorpus(draft)
+      else if (action === 'update') r = updateCorpus(draft)
+      else if (action === 'delete') {
+        if (args?.confirm !== true) return JSON.stringify({ ok: false, error: '删除需要 confirm: true' }, null, 2)
+        r = deleteCorpus(draft.id)
+      } else return JSON.stringify({ ok: false, error: `未知 action：${action}（create/update/delete）` }, null, 2)
+      if (r.ok) { onCorpusChanged?.(); saveState() }
+      return JSON.stringify(r, null, 2)
+    },
+  })
+
+  register({
     name: 'corpus_status',
     description: '语料「文意疏通」驾驶舱只读状态：错字/标点两条通道进度、新稿落点/产物存档两处文件数、最近一批、是否在跑、是否暂停、累计 token、门禁记忆。返回 JSON。',
     parameters: { type: 'object', properties: {} },
@@ -1862,6 +2068,48 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             })
             return
           }
+          const readJsonBody = (cb: (b: Record<string, any>) => void): void => {
+            let body = ''
+            req.on('data', (c: any) => { body = (body + String(c)).slice(0, 8192) })
+            req.on('end', () => {
+              try { cb(body ? JSON.parse(body) : {}) } catch (e) { json(400, { ok: false, error: `请求体不是 JSON：${String(e)}` }) }
+            })
+          }
+          const busyBody = (): Record<string, unknown> | null => {
+            if (inFlight) return { ok: false, error: 'BUSY', message: `批次在跑（${inFlight}），跑完再改语料` }
+            if (biliBusy) return { ok: false, error: 'BUSY', message: `转写任务在跑（${biliBusy.id}），跑完再改语料` }
+            return null
+          }
+          if (path === '/dsh-bili-corpus/api/corpora/create' && String(req.method).toUpperCase() === 'POST') {
+            readJsonBody((b) => {
+              const busy = busyBody()
+              if (busy) { json(409, busy); return }
+              const r = createCorpus(b as CorpusDraft)
+              if (r.ok) { onCorpusChanged?.(); saveState() }
+              json(r.ok ? 200 : 400, r)
+            })
+            return
+          }
+          if (path === '/dsh-bili-corpus/api/corpora/update' && String(req.method).toUpperCase() === 'POST') {
+            readJsonBody((b) => {
+              const busy = busyBody()
+              if (busy) { json(409, busy); return }
+              const r = updateCorpus(b as CorpusDraft)
+              if (r.ok) { onCorpusChanged?.(); saveState() }
+              json(r.ok ? 200 : 400, r)
+            })
+            return
+          }
+          if (path === '/dsh-bili-corpus/api/corpora/delete' && String(req.method).toUpperCase() === 'POST') {
+            readJsonBody((b) => {
+              const busy = busyBody()
+              if (busy) { json(409, busy); return }
+              const r = deleteCorpus(String(b.id ?? b.corpus ?? ''))
+              if (r.ok) { onCorpusChanged?.(); saveState() }
+              json(r.ok ? 200 : 400, r)
+            })
+            return
+          }
           if (path === '/dsh-bili-corpus/api/status') { json(200, bindCorpus(qCorpus, statusBody)); return }
           if (path === '/dsh-bili-corpus/api/jobs') {
             const body = bindCorpus(qCorpus, () => ({ at: nowIso(), ok: true, ...biliSummary(), jobs: jobs.slice(-50).reverse() }))
@@ -1901,7 +2149,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
           json(404, { ok: false, error: 'not found', path: url.pathname })
         },
       }), `${SHORT}: http`)
-      log('host HTTP 端点已挂载：/dsh-bili-corpus/api/{corpora,corpus,status,jobs,transcribe,pause,resume}')
+      log('host HTTP 端点已挂载：/dsh-bili-corpus/api/{corpora,corpora/create|update|delete,corpus,status,jobs,transcribe,pause,resume}')
     }
   } catch (e) {
     log(`HTTP 端点挂载失败（面板降级为只读提示）: ${String(e)}`)

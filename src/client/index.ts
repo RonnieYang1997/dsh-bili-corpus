@@ -295,7 +295,16 @@ function TranscribeSection(props: { status: Status | null; refresh: () => void; 
 function CockpitPanel(): ReactElement {
   const [status, setStatus] = useState<Status | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
-  type CorpusChip = { id: string; naming?: string; docPrefix?: string }
+  type CorpusChip = {
+    id: string
+    naming?: string
+    docPrefix?: string
+    indexFile?: string
+    landing?: string
+    archive?: string
+    state?: string
+  }
+  type CorpusForm = { id: string; naming: string; docPrefix: string; indexFile: string; landing: string; archive: string; state: string }
   const [corpora, setCorpora] = useState<CorpusChip[]>([])
   const [active, setActive] = useState('')
 
@@ -326,6 +335,73 @@ function CockpitPanel(): ReactElement {
         }
       })
       .catch((e: unknown) => setFailure(String(e)))
+  }, [refresh])
+
+  const [manage, setManage] = useState(false)
+  const [form, setForm] = useState<CorpusForm | null>(null)
+  const [editing, setEditing] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [mmsg, setMmsg] = useState<string | null>(null)
+
+  const startCreate = useCallback(() => {
+    setEditing('')
+    setForm({ id: '', naming: 'bvid', docPrefix: 'dufu-', indexFile: 'MEMORY.md', landing: '', archive: '', state: '' })
+    setMmsg(null)
+    setManage(true)
+  }, [])
+
+  const startEdit = useCallback((c: CorpusChip) => {
+    setEditing(c.id)
+    setForm({
+      id: c.id,
+      naming: c.naming || 'bvid',
+      docPrefix: c.docPrefix || 'dufu-',
+      indexFile: c.indexFile ?? 'MEMORY.md',
+      landing: c.landing || '',
+      archive: c.archive || '',
+      state: c.state || '',
+    })
+    setMmsg(null)
+  }, [])
+
+  const saveCorpus = useCallback(() => {
+    if (!form) return
+    setBusy(true)
+    const path = editing ? '/corpora/update' : '/corpora/create'
+    fetch(`${API}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...form, id: editing || form.id }),
+    })
+      .then((r) => r.json())
+      .then((r: { ok?: boolean; error?: string }) => {
+        if (r?.ok === false) { setMmsg(r.error ?? '保存失败'); return }
+        setMmsg(editing ? `已更新 ${editing}` : '已新建')
+        setForm(null)
+        setEditing('')
+        void refresh()
+      })
+      .catch((e: unknown) => setMmsg(String(e)))
+      .finally(() => setBusy(false))
+  }, [form, editing, refresh])
+
+  const removeCorpus = useCallback((id: string) => {
+    if (typeof window !== 'undefined' && typeof window.confirm === 'function' && !window.confirm(`删除语料 ${id}？只删配置，目录保留；目录里还有稿件会被拒绝。`)) return
+    setBusy(true)
+    setMmsg(null)
+    fetch(`${API}/corpora/delete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id }),
+    })
+      .then((r) => r.json())
+      .then((r: { ok?: boolean; error?: string }) => {
+        if (r?.ok === false) { setMmsg(r.error ?? '删除失败'); return }
+        setMmsg(`已删除 ${id}`)
+        void refresh()
+      })
+      .catch((e: unknown) => setMmsg(String(e)))
+      .finally(() => setBusy(false))
   }, [refresh])
 
   useEffect(() => {
@@ -396,6 +472,84 @@ function CockpitPanel(): ReactElement {
     )
   }
 
+  const fieldRow = (label: string, key: keyof CorpusForm, placeholder?: string, locked?: boolean): ReactElement =>
+    h(
+      'label',
+      { key, style: { display: 'flex', gap: 6, alignItems: 'center', margin: '2px 0' } },
+      h('span', { style: { width: 88, color: '#666', fontSize: 12 } }, label),
+      h('input', {
+        value: form ? form[key] : '',
+        placeholder: placeholder ?? '',
+        disabled: busy || locked,
+        onChange: (e: any) => {
+          const v = String(e?.target?.value ?? '')
+          setForm((f) => (f ? { ...f, [key]: v } : f))
+        },
+        style: { flex: 1, fontSize: 12, padding: '2px 6px', minWidth: 0 },
+      }),
+    )
+
+  const manageBox: ReactElement = form
+    ? h(
+        'div',
+        { style: { border: '1px solid #ddd', borderRadius: 6, padding: '6px 8px', margin: '0 0 8px', background: '#fafafa' } },
+        h('div', { style: { fontSize: 12, color: '#555', marginBottom: 4 } }, editing ? `编辑语料 ${editing}` : '新建语料'),
+        fieldRow('id', 'id', '小写字母/数字/-/_', !!editing),
+        h(
+          'label',
+          { style: { display: 'flex', gap: 6, alignItems: 'center', margin: '2px 0' } },
+          h('span', { style: { width: 88, color: '#666', fontSize: 12 } }, '命名策略'),
+          h(
+            'select',
+            {
+              value: form.naming,
+              disabled: busy,
+              onChange: (e: any) => {
+                const v = String(e?.target?.value ?? 'bvid')
+                setForm((f) => (f ? { ...f, naming: v } : f))
+              },
+              style: { fontSize: 12 },
+            },
+            h('option', { value: 'bvid' }, 'bvid（dufu-BV号.md）'),
+            h('option', { value: 'title' }, 'title（标题-BV号.md）'),
+          ),
+        ),
+        fieldRow('落点', 'landing', '绝对路径；留空 = ~/.dsh/corpus/<id>/memory'),
+        fieldRow('存档', 'archive', '绝对路径（必填）'),
+        fieldRow('状态目录', 'state', '绝对路径；留空 = ~/.dsh/corpus/<id>/_smoothing_state'),
+        fieldRow('文件名前缀', 'docPrefix', 'dufu-'),
+        fieldRow('索引文件', 'indexFile', 'MEMORY.md；留空 = 不维护索引'),
+        mmsg ? h('div', { style: { color: '#c66', fontSize: 12 } }, mmsg) : null,
+        h(
+          'div',
+          { style: { display: 'flex', gap: 8, marginTop: 6 } },
+          h('button', { type: 'button', style: btnStyle, disabled: busy, onClick: saveCorpus }, busy ? '保存中…' : '保存'),
+          h('button', { type: 'button', style: btnStyle, disabled: busy, onClick: () => { setForm(null); setEditing('') } }, '取消'),
+        ),
+      )
+    : h(
+        'div',
+        { style: { border: '1px solid #ddd', borderRadius: 6, padding: '6px 8px', margin: '0 0 8px', background: '#fafafa' } },
+        h('div', { style: { fontSize: 12, color: '#555', marginBottom: 4 } }, '语料管理（写 corpora.json；删除只删配置，目录保留）'),
+        ...corpora.map((c) =>
+          h(
+            'div',
+            { key: c.id, style: { display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, margin: '2px 0' } },
+            h('span', { style: { width: 90, fontWeight: 600 } }, c.id),
+            h('span', { style: { color: '#777', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, `${c.naming || 'bvid'} · ${c.archive || '-'}`),
+            h('button', { type: 'button', style: { ...btnStyle, padding: '1px 8px' }, onClick: () => startEdit(c) }, '编辑'),
+            h('button', { type: 'button', style: { ...btnStyle, padding: '1px 8px' }, onClick: () => removeCorpus(c.id) }, '删除'),
+          ),
+        ),
+        mmsg ? h('div', { style: { color: '#c66', fontSize: 12, marginTop: 4 } }, mmsg) : null,
+        h(
+          'div',
+          { style: { display: 'flex', gap: 8, marginTop: 6 } },
+          h('button', { type: 'button', style: btnStyle, onClick: startCreate }, '＋ 新建语料'),
+          h('button', { type: 'button', style: btnStyle, onClick: () => { setManage(false); setMmsg(null) } }, '收起'),
+        ),
+      )
+
   return h(
     'div',
     { style: cardStyle },
@@ -411,7 +565,9 @@ function CockpitPanel(): ReactElement {
         style: { ...btnStyle, padding: '2px 8px', opacity: c.id === active ? 0.55 : 1 },
         onClick: () => switchTo(c.id),
       }, c.id)),
+      h('button', { type: 'button', style: { ...btnStyle, padding: '2px 8px' }, onClick: () => setManage((v) => !v) }, manage ? '收起管理' : '管理'),
     ),
+    manage ? manageBox : null,
     failure
       ? h('div', { style: { color: '#e88' } }, `host 端点不可用（${failure}）。请在会话里用工具 bili_jobs / corpus_status 查看。`)
       : status

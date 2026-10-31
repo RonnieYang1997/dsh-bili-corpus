@@ -48,7 +48,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 旧的 `dsh-corpus-cockpit` 已卸载：本插件用同名 `corpus_*` 工具接管，状态/台账路径不变，
 因此 180 批历史与门禁状态都继承下来。
 
-## 工具（10 个）
+## 工具（11 个）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -61,6 +61,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `corpus_mirror_sync {dryRun?}` | 把落点里的稿补进「产物存档」（内容不同才覆盖、缺的补、存档多出的只报告）。默认 dryRun=true。 |
 | `corpus_hydrate {dryRun?, limit?}` | 反向补齐：把存档里有、落点里没有的稿复制回落点（旧稿要在落点开批前先补齐）。默认 dryRun=true 只报告。 |
 | `corpus_use {id?}` | 不带 id = 列出全部语料与当前生效语料；带 id = 切换（写 `~/.dsh/corpus/active-corpus.json`，重载插件后保持）。批次/转写在跑时拒绝。 |
+| `corpus_manage {action, id, naming?, landing?, archive?, state?, docPrefix?, indexFile?, confirm?}` | 新建 / 编辑 / 删除语料（写 `corpora.json` 并建目录）。`action=delete` 必须 `confirm:true`；删除只删配置、目录保留；内置语料、生效语料、目录里还有带 BV 号稿件的语料都会被拒。批次/转写在跑时 BUSY。 |
 
 ## HTTP 端点
 
@@ -69,6 +70,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 - `GET  /status?corpus=<id>` — 面板数据（清洗状态 + `transcribe` 队列摘要与引擎自检）；缺 `corpus` = 当前生效语料
 - `GET  /corpora` — 语料清单（id/路径/当前生效）
 - `POST /corpus` — `{id}` 切换当前语料（批次/转写在跑时 409）
+- `POST /corpora/create` / `POST /corpora/update` / `POST /corpora/delete` — 语料新建/编辑/删除（面板「管理」与 `corpus_manage` 走同一套校验；delete 需 `confirm` 语义由面板弹窗承担）
 - `GET  /jobs` — 转写队列
 - `POST /transcribe` — `{target|bvid|url, force?}` 入队
 - `POST /pause` / `POST /resume` — 清洗闸门
@@ -144,7 +146,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 
 **P0 已落地**：语料由 `~/.dsh/corpus/corpora.json` 描述（`id → {docPrefix,indexFile,landing,archive,state}`），
 面板标题下有语料 chip 可直接切换（`corpus_use` / `POST /api/corpus` 同一效果），当前语料记在
-`active-corpus.json`，重载插件后保持。新增语料 = 往 corpora.json 里加一条 + 重载插件。
+`active-corpus.json`，重载插件后保持。新增语料可以直接在面板 `管理` 里新建（或 `corpus_manage`），也可以手改 corpora.json 后重载插件。
 
 自带冒烟脚本（2026-10-30 用 `demo` 语料实测通过）：
 
