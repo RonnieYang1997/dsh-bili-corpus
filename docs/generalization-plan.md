@@ -1,6 +1,6 @@
 # dsh-bili-corpus 泛化改造计划（草案 v1 · 2026-10-30）
 
-> **进度**：P0 已于 2026-10-30 落地（`~/.dsh/corpus/corpora.json` + `corpus_use` + 面板语料 chip + `GET /api/corpora` / `POST /api/corpus` / `GET /api/status?corpus=`）；**P1 已于 2026-10-31 落地**（引擎脚本内嵌 `python/engine/scripts`，bridge 优先内置引擎，ffmpeg/venv/模型搬到 `~/.dsh/speech-to-text/` 侧自动探测；验收方式：把 AionUi 技能目录整个改名后冷跑 `BV1Genn6AEpk` 成功）；**P2a 已于 2026-10-31 落地**（7 个清洗脚本内嵌 `python/pipeline`，`paths.py` 读宿主注入的 `DSH_CORPUS_LANDING/ARCHIVE/STATE/PATCHES/DOC_PREFIX/ASR_RAW`；补丁目录按语料隔离 `<STATE>/_patches/batch-N`；门禁 cwd 改 `python/pipeline`；`demo` 上 dryRun 批次端到端通过）。P2b/P2c、P3 未动。
+> **进度**：P0 已于 2026-10-30 落地（`~/.dsh/corpus/corpora.json` + `corpus_use` + 面板语料 chip + `GET /api/corpora` / `POST /api/corpus` / `GET /api/status?corpus=`）；**P1 已于 2026-10-31 落地**（引擎脚本内嵌 `python/engine/scripts`，bridge 优先内置引擎，ffmpeg/venv/模型搬到 `~/.dsh/speech-to-text/` 侧自动探测；验收方式：把 AionUi 技能目录整个改名后冷跑 `BV1Genn6AEpk` 成功）；**P2a 已于 2026-10-31 落地**（7 个清洗脚本内嵌 `python/pipeline`，`paths.py` 读宿主注入的 `DSH_CORPUS_LANDING/ARCHIVE/STATE/PATCHES/DOC_PREFIX/ASR_RAW`；补丁目录按语料隔离 `<STATE>/_patches/batch-N`；门禁 cwd 改 `python/pipeline`；`demo` 上 dryRun 批次端到端通过）。**P2b 已于 2026-10-31 完成**（旧/新引擎同批补丁对拍：报告与产物 sha256 逐字节一致；demo 真批次批 3 落地 2 篇、门禁 PASS）；**P2c 已于 2026-10-31 完成**（`DSH_CORPUS_ENGINE=legacy` 回滚开关；台账批次记录带 `corpus` 戳）。P3 未动。
 
 > 目标：从「独夫之心专用」变成「任意音频 → 转写稿」+「任意文本语料 → LLM 校对 / 标点恢复 / 门禁」的通用插件。
 > 本文只是计划，不含实现；每个阶段都可独立交付、独立回滚。
@@ -110,7 +110,9 @@ glob 规则：`docPrefix` 参与扫描（`^<prefix>.+\.md$`），索引行形模
 - ✅ 顺手修掉宿主给 `apply_smoothing.py` 传 `--guard` 的老 bug（现版只认 `--snap`）。
 - 验收（dryRun）：`demo` 语料上 `queue 4 篇 → 补丁 10 → apply(dry) 2 篇 → record 跳过 → 门禁 PASS`；
   `dufuzhixin` 的 `corpus_gates` 从 pipeline 跑 1.7 s 通过；落点/存档 sha 未变、无串库写入。
-- 未做（P2b/P2c）：demo/副本的真批次对拍、`ledger` 加 `corpus` 字段、cutover 与 `legacy/` 回滚开关；`corpus_lint.py` 规则仍写死 `dufu-BV*.md`。
+- **P2b（2026-10-31 已完成）**：见附录 B。
+- **P2c（2026-10-31 已完成）**：回滚开关 = env `DSH_CORPUS_ENGINE=legacy`（批次链路改走 `_scratch` 旧脚本，其余不受影响；旧脚本路径写死 dufuzhixin，故只对 dufuzhixin 有意义）。`ledger` 的 `corpus` 字段取舍：**加**——宿主自动传 `DSH_CORPUS_ID`，`smoothing_batch.py record` 写进批次记录；每语料本就有独立 `STATE`，所以只作排查用的戳，不参与路径计算，老台账无该字段也照常读。
+- 仍待：`corpus_lint.py` 规则仍写死 `dufu-BV*.md`；P3 面板多语料。
 
 原计划（P2b/P2c 仍适用）：
 - 迁移：`smoothing_batch.py`、`apply_smoothing.py`、`punct_local.py`、`punct_apply.py`、`punct_queue.py`、`corpus_lint.py`、`corpus_lint_selftest.py` → `python/pipeline/`。
@@ -179,3 +181,30 @@ glob 规则：`docPrefix` 参与扫描（`^<prefix>.+\.md$`），索引行形模
 清洗引擎（`corpus_batch` 背后的 `_scratch` 脚本）仍然绑死 dufuzhixin（`corpus_paths.py` 常量 +
 `MIR` 写死 + `assert_corpus_root(min_transcripts=1000)`），在 demo 上跑 `corpus_batch` 会读错库。
 这正好把 P0/P2 的必要性从「猜测」变成了「实测」。
+
+## 附录 B：旧/新引擎对拍（2026-10-31，P2b）
+
+**目的**：确认 `python/pipeline` 与旧 `_scratch` 引擎在同一输入下产出完全一致，才敢让正式语料切过去。
+
+**方法**：脚本 `_p2b_compare.py`（临时，未入库）把 demo 语料的 4 篇稿 + demo 批次 1 的补丁
+（`BV1Genn6AEpk.json` / `BVdemo00001.json`）复制成两套独立沙箱（old/new）。
+- 旧引擎：`_scratch/apply_smoothing.py`，仅把其硬编码 `MIRROR` 换成沙箱路径（等价于当年的
+  「`corpus_paths` 指向哪就写哪」），其余一行不改；
+- 新引擎：`python/pipeline/apply_smoothing.py`，只给 `DSH_CORPUS_LANDING/ARCHIVE/STATE/PATCHES/DOC_PREFIX/ASR_RAW`。
+两边都跑 `--drop-bad --snap --report`，比对报告字段与最终文件 sha256。
+
+**结果**：`RESULT: IDENTICAL`
+
+| 项 | 旧引擎 | 新引擎 |
+| --- | --- | --- |
+| 小结 | 成功 2 篇（10 条补丁，丢弃 1 条） | 同 |
+| BV1Genn6AEpk | patches 9 / dropped 1 / sha f322231621fa → fe418dd79fee | 同 |
+| BVdemo00001 | patches 1 / dropped 0 / sha 6efb5ca69003 → 3bca296573df | 同 |
+| 4 篇最终 sha | — | 全部逐字节一致 |
+
+**demo 真批次（非 dryRun）**：`corpus_batch {corpus:'demo', kind:'error', size:4, dryRun:false}`
+→ 批 3：queue 4 → 补丁 7 → 落地 2 篇（BV1Genn6AEpk 6 条、BVdemo00001 1 条）→ 门禁 PASS。
+落点/存档 4 篇 sha 全一致；`MEMORY.md` 索引 4 行未变；dufuzhixin 台账 `batches 208 / docs 3760` 零改动，
+`~/.dsh/corpus/dufuzhixin/_smoothing_state/_patches` 不存在（补丁只在 demo 自己的 STATE 下）。
+
+**结论**：内嵌引擎与旧引擎行为等价；P2a 的路径改造没有改变落地语义。`legacy` 开关只在应急时用。

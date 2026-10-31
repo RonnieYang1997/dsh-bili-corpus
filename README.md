@@ -115,6 +115,9 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `DSH_CORPUS_STATE` / `DSH_CORPUS_MAIN` / `DSH_CORPUS_ARCHIVE` / `DSH_CORPUS_LINT_DIR` | 单语料 env 兜底（不写 corpora.json 时生效；旧名 `DSH_CORPUS_MIRROR` 仍是 ARCHIVE 别名） |
 | `DSH_CORPUS_PIPELINE` | 清洗脚本目录，默认插件内 `python/pipeline`（P2a 起不用 `_scratch`） |
 | `DSH_CORPUS_PATCHES` | 补丁根，默认 `<STATE>/_patches`；由宿主自动传给 python 子进程 |
+| `DSH_CORPUS_ENGINE` | `pipeline`（默认，用内嵌 `python/pipeline`）或 `legacy`（回退 `default-workspace/_scratch` 旧脚本；只对 dufuzhixin 有意义） |
+| `DSH_CORPUS_SCRATCH` | `legacy` 模式下的旧脚本目录，默认 `C:/Users/Ronnie/Documents/deepseek-harness/default-workspace/_scratch` |
+| `DSH_CORPUS_ID` | 宿主自动传：把语料 id 打进台账批次记录（`corpus` 字段），便于排查串库 |
 | `DSH_CORPUS_AUTO` | `false`（不自动跑批） |
 
 ## 转写引擎（P1：已内嵌，2026-10-31）
@@ -170,10 +173,18 @@ node scripts/smoke-second-corpus.mjs --id demo --transcribe BV112uU6BEQM   # 顺
 `default-workspace/_scratch/_patches`，属于历史）。
 门禁默认 `cwd` 也是 `python/pipeline`（`DSH_CORPUS_LINT_DIR` 仍可覆盖；lint 默认只判存档单根）。
 
-当前 demo 上可以真跑 `corpus_batch`（dryRun 实测通过：queue 4 篇 → 补丁 10 → apply(dry) 2 篇 → 门禁 PASS；
-真写只影响 demo 语料）。
+**P2b 对拍（2026-10-31）**：同一批稿件 + 同一份补丁，分别在「旧 `_scratch` 引擎」和
+「新 `python/pipeline` 引擎」的沙箱副本上落地，报告（每篇 patches/dropped/sha_before/sha_after）
+与产物 sha256 **逐字节一致**，见 `docs/generalization-plan.md` 附录 B。
+demo 语料真批次（非 dryRun）也跑通：批 3 → queue 4 → 补丁 7 → 落地 2 篇 → 门禁 PASS，
+落点/存档 sha 一致、MEMORY.md 索引 4 行未变、dufuzhixin 台账零改动。
 
-仍待做（P2b/P2c）：demo 副本真批次对拍、切换成「每语料独立引擎配置」的正式形态。
+**P2c 回滚开关（2026-10-31）**：`DSH_CORPUS_ENGINE=legacy` 时批次链路改走 `_scratch` 旧脚本
+（其余功能不受影响）。旧脚本的路径写死 dufuzhixin，所以回退只对 dufuzhixin 有意义；
+新代码出问题时把这一条塞进启动 env 即可回到 P2a 之前的行为。
+台账批次记录现在带 `corpus` 字段（宿主自动传 `DSH_CORPUS_ID`），配合「每语料一个 STATE 目录」
+可以一眼看出某批属于谁。
+
 注意：`corpus_lint.py` 的规则仍按 `dufu-BV*.md` 命名写死（`docPrefix` 只影响读写与索引），
 换非 `dufu-` 前缀的语料要先改 lint 规则。
 

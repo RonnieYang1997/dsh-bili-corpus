@@ -37,6 +37,8 @@ MIRROR = ARCHIVE
 MAIN_ROOTS = [LANDING, ARCHIVE]
 
 DOC_PREFIX = os.environ.get("DSH_CORPUS_DOC_PREFIX") or "dufu-"
+# 语料 id：只用来在台账里打戳（排查串库），不参与任何路径计算。
+CORPUS_ID = os.environ.get("DSH_CORPUS_ID") or ""
 PATCHES = os.path.abspath(
     os.environ.get("DSH_CORPUS_PATCHES") or os.path.join(STATE, "_patches"))
 ASR_RAW = os.path.abspath(

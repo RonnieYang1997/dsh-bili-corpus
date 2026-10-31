@@ -239,10 +239,20 @@ const BILI_FFMPEG = E.DSH_BILI_FFMPEG
 const BILI_FFPROBE = E.DSH_BILI_FFPROBE || BILI_FFMPEG.replace('ffmpeg.exe', 'ffprobe.exe')
 const BILI_MODEL_FILE = join(BILI_MODEL_DIR, 'model.int8.onnx')
 
-const BATCH_SCRIPT = join(PIPELINE, 'smoothing_batch.py')
-const APPLY_SCRIPT = join(PIPELINE, 'apply_smoothing.py')
-const PUNCT_LOCAL = join(PIPELINE, 'punct_local.py')
-const PUNCT_APPLY = join(PIPELINE, 'punct_apply.py')
+// 引擎来源开关：默认用插件内嵌的 python/pipeline（P2a 起）。
+// 设 DSH_CORPUS_ENGINE=legacy 回退到旧的 _scratch 脚本（应急回滚；_scratch 脚本
+// 的路径写死 dufuzhixin，所以回退只对 dufuzhixin 有意义）。
+// 回退只影响「跑批次」这条链路；转写/归档/门禁/面板不受影响。
+const ENGINE_MODE = (E.DSH_CORPUS_ENGINE || 'pipeline').toLowerCase()
+const LEGACY_SCRATCH = E.DSH_CORPUS_SCRATCH || join(WORKSPACE, '_scratch')
+const USE_LEGACY_SCRIPTS = ENGINE_MODE === 'legacy'
+const SCRIPT_DIR = USE_LEGACY_SCRIPTS ? LEGACY_SCRATCH : PIPELINE
+const SCRIPT_CWD = USE_LEGACY_SCRIPTS ? LEGACY_SCRATCH : PIPELINE
+const patchRoot = () => (USE_LEGACY_SCRIPTS ? join(LEGACY_SCRATCH, '_patches') : join(P().state, '_patches'))
+const BATCH_SCRIPT = join(SCRIPT_DIR, 'smoothing_batch.py')
+const APPLY_SCRIPT = join(SCRIPT_DIR, 'apply_smoothing.py')
+const PUNCT_LOCAL = join(SCRIPT_DIR, 'punct_local.py')
+const PUNCT_APPLY = join(SCRIPT_DIR, 'punct_apply.py')
 // 与 _scratch/smoothing_batch.py 的 DONE_STATUS 对齐（2026-10-13）：
 // 'skip' 是"代理读过、判定无需改动但落地时报补丁为空"的稿子——它同样算走完一遍，
 // 否则驾驶舱的 docsDone 永远差 14 篇到不了 3747（UI 上会显示"未完成"）。
@@ -313,7 +323,8 @@ function run(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: numb
       DSH_CORPUS_LANDING: P().landing,
       DSH_CORPUS_ARCHIVE: P().archive,
       DSH_CORPUS_STATE: P().state,
-      DSH_CORPUS_PATCHES: join(P().state, '_patches'),
+      DSH_CORPUS_PATCHES: patchRoot(),
+      DSH_CORPUS_ID: P().id,
       DSH_CORPUS_DOC_PREFIX: P().docPrefix,
       DSH_CORPUS_ASR_RAW: join(dirname(P().state), '_asr_raw'),
       DSH_CORPUS_LINT_BASELINE: lintBaseline(),
@@ -813,7 +824,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     try {
       await verifyNames(bvid, body, patches)
     } catch { /* 核实只是加分项，绝不阻断 */ }
-    const dir = join(P().state, '_patches', `batch-${batchNo}`)
+    const dir = join(patchRoot(), `batch-${batchNo}`)
     ensureDir(dir)
     writeJson(join(dir, `${bvid}.json`), {
       bvid,
@@ -841,7 +852,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const batchNo = Number.isFinite(opts.batch as number) ? Number(opts.batch) : maxN + 1
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'queue', startedAt: nowIso() }
-    const q = run(P().python, [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)], { cwd: PIPELINE, timeoutMs: 300000 })
+    const q = run(P().python, [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)], { cwd: SCRIPT_CWD, timeoutMs: 300000 })
     if (q.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'queue', error: `queue rc=${q.rc}`, tail: tail(q.out) }
     }
@@ -850,7 +861,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     // 旧主库已退役：清洗脚本按「落点 + 存档」两副本工作，缺的从存档补进落点。
     const hyd = hydrateDocs(queue.map((x) => String(x.bvid)))
     if (hyd.copied > 0) log(`批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
-    const snap = run(P().python, [BATCH_SCRIPT, 'snapshot', '--batch', String(batchNo)], { cwd: PIPELINE, timeoutMs: 600000 })
+    const snap = run(P().python, [BATCH_SCRIPT, 'snapshot', '--batch', String(batchNo)], { cwd: SCRIPT_CWD, timeoutMs: 600000 })
     if (snap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'snapshot', error: `snapshot rc=${snap.rc}`, tail: tail(snap.out) }
     }
@@ -868,7 +879,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'verify', startedAt: nowIso() }
-    const ver = run(P().python, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: PIPELINE, timeoutMs: 900000 })
+    const ver = run(P().python, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: SCRIPT_CWD, timeoutMs: 900000 })
     if (ver.rc !== 0) {
       return {
         ok: false, batch: batchNo, kind: 'error', phase: 'verify', status: 'FAILED',
@@ -878,7 +889,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
 
     inFlight = { kind: 'error', batch: batchNo, phase: 'apply', startedAt: nowIso() }
-    const patchDir = join(P().state, '_patches', `batch-${batchNo}`)
+    const patchDir = join(patchRoot(), `batch-${batchNo}`)
     const reportFile = join(P().state, `report-batch-${batchNo}.json`)
     const applyArgs = [
       APPLY_SCRIPT, '--dir', patchDir,
@@ -889,13 +900,13 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       '--drop-bad',
     ]
     if (opts.dryRun) applyArgs.push('--dry-run')
-    const ap = run(P().python, applyArgs, { cwd: PIPELINE, timeoutMs: 900000 })
+    const ap = run(P().python, applyArgs, { cwd: SCRIPT_CWD, timeoutMs: 900000 })
     if (ap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'apply', status: 'FAILED', error: `apply rc=${ap.rc}`, tail: tail(ap.out) }
     }
     const report = readJson<Record<string, any>>(reportFile, {})
     if (!opts.dryRun) {
-      const rec = run(P().python, [BATCH_SCRIPT, 'record', '--batch', String(batchNo)], { cwd: PIPELINE, timeoutMs: 300000 })
+      const rec = run(P().python, [BATCH_SCRIPT, 'record', '--batch', String(batchNo)], { cwd: SCRIPT_CWD, timeoutMs: 300000 })
       if (rec.rc !== 0) {
         return { ok: false, batch: batchNo, kind: 'error', phase: 'record', status: 'FAILED', error: `record rc=${rec.rc}`, tail: tail(rec.out) }
       }
@@ -964,7 +975,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     if (hyd.copied > 0) log(`punct 批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
     inFlight = { kind: 'punct', batch: batchNo, phase: 'local-model', startedAt: nowIso() }
     const local = run(P().pythonAsr, [PUNCT_LOCAL, '--batch', String(batchNo)], {
-      cwd: PIPELINE,
+      cwd: SCRIPT_CWD,
       timeoutMs: Number(E.DSH_CORPUS_PUNCT_TIMEOUT_MS || 4 * 3600 * 1000),
     })
     if (local.rc !== 0) {
@@ -973,7 +984,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     inFlight = { kind: 'punct', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const applyArgs = [PUNCT_APPLY, '--batch', String(batchNo)]
     if (opts.dryRun) applyArgs.push('--dry-run')
-    const ap = run(P().python, applyArgs, { cwd: PIPELINE, timeoutMs: 1800000 })
+    const ap = run(P().python, applyArgs, { cwd: SCRIPT_CWD, timeoutMs: 1800000 })
     if (ap.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'punct', phase: 'apply', status: 'FAILED', error: `punct_apply rc=${ap.rc}`, tail: tail(ap.out) }
     }

@@ -236,10 +236,12 @@ def cmd_record(a):
             "sha": [r.get("sha_before"), r.get("sha_after")],
             "errors": r["errors"], "at": datetime.datetime.now().isoformat(timespec="seconds"),
         }
-    led["batches"][str(a.batch)].update(
-        {"applied": n_ok, "skipped": n_skip, "dry_run": rep["dry_run"],
-         "total_patches": rep["total_patches"], "total_dropped": rep.get("total_dropped", 0),
-         "recorded_at": datetime.datetime.now().isoformat(timespec="seconds")})
+    upd = {"applied": n_ok, "skipped": n_skip, "dry_run": rep["dry_run"],
+           "total_patches": rep["total_patches"], "total_dropped": rep.get("total_dropped", 0),
+           "recorded_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    if _cp.CORPUS_ID:
+        upd["corpus"] = _cp.CORPUS_ID
+    led["batches"][str(a.batch)].update(upd)
     save_ledger(led)
     print("台账已更新：批 %d 记 %d 篇（跳过 %d）" % (a.batch, n_ok, n_skip))
     return 0
