@@ -59,7 +59,7 @@ n_ok = n_bad = 0
 report = []
 for x in batch:
     b = x["bvid"]
-    n = "%s%s.md" % (_cp.DOC_PREFIX, b)
+    n = _cp.doc_name(b)
     if not a.force and led["punct"].get(b, {}).get("status") == "done":
         print("  ==   %s 已落地过（跳过）" % b)
         continue

@@ -48,9 +48,24 @@ SKILL_SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 
 
 def doc_exists_anywhere(bvid):
-    """新旧任一主库里有 dufu-<bvid>.md 就算已有语料。"""
-    name = "%s%s.md" % (_pp.DOC_PREFIX, bvid)
-    return any(os.path.exists(os.path.join(r, name)) for r in MAIN_ROOTS)
+    """任一主库里已有该讲就算已转写过。
+
+    bvid 语料看 `dufu-<bvid>.md`；人工编号语料（docPattern）文件名不含 BV 号，
+    改查 `<STATE>/docmap.json` 里 host 归档时写下的 {bvid: 文件名}。
+    """
+    name = _pp.doc_name(bvid)
+    if any(os.path.exists(os.path.join(r, name)) for r in MAIN_ROOTS):
+        return True
+    dm = os.path.join(_pp.STATE, "docmap.json")
+    if os.path.exists(dm):
+        try:
+            with open(dm, "r", encoding="utf-8") as f:
+                fn = (json.load(f) or {}).get(bvid)
+        except Exception:
+            fn = None
+        if fn and any(os.path.exists(os.path.join(r, fn)) for r in MAIN_ROOTS):
+            return True
+    return False
 
 
 def log_line(msg):

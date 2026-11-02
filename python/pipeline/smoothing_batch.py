@@ -103,9 +103,9 @@ def cmd_queue(a):
         if not b.get("recorded_at"):
             inflight.update(b.get("queued") or [])
     for f in sorted(_cp.iter_names()):
-        if not f.startswith(_cp.DOC_PREFIX) or not f.endswith(".md"):
+        if not _cp.is_doc(f):
             continue
-        bvid = f[len(_cp.DOC_PREFIX):-3]
+        bvid = _cp.stem(f)
         if bvid in inflight:
             continue
         if led["docs"].get(bvid, {}).get("status") in DONE_STATUS and bvid not in (
@@ -155,7 +155,7 @@ def cmd_snapshot(a):
     snap = {}
     for x in batch:
         bvid = x["bvid"]
-        pm, pr = _cp.doc(bvid), os.path.join(MIR, "%s%s.md" % (_cp.DOC_PREFIX, bvid))
+        pm, pr = _cp.doc(bvid), _cp.doc_path(bvid, MIR)
         snap[bvid] = {"main": sh(pm), "mirror": sh(pr)}
     sf = os.path.join(STATE, "snap-batch-%d.json" % a.batch)
     with open(sf, "w", encoding="utf-8") as f:
@@ -169,7 +169,7 @@ def cmd_verify(a):
     snap = json.load(open(sf, "r", encoding="utf-8"))
     changed = []
     for bvid, want in snap.items():
-        pm, pr = _cp.doc(bvid), os.path.join(MIR, "%s%s.md" % (_cp.DOC_PREFIX, bvid))
+        pm, pr = _cp.doc(bvid), _cp.doc_path(bvid, MIR)
         got = {"main": sh(pm), "mirror": sh(pr)}
         if got != want:
             changed.append((bvid, want, got))
@@ -252,7 +252,7 @@ def cmd_status(a):
     docs = led["docs"]
     from collections import Counter
     c = Counter(v["status"] for v in docs.values())
-    total = len([f for f in _cp.iter_names() if f.startswith(_cp.DOC_PREFIX) and f.endswith(".md")])
+    total = len([f for f in _cp.iter_names() if _cp.is_doc(f)])
     print("语料总量 %d 篇 | 台账已记 %d 篇" % (total, len(docs)))
     print("  已完成 %d | 实为已修好(already) %d | 无问题 %d | 跳过 %d"
           % (c["done"], c["already"], c["empty"], c["skip"]))

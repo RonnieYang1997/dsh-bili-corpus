@@ -12,7 +12,7 @@ Requires: Python 3.8+, standard library only. ffmpeg for audio splitting.
   模型取自用户已备好的 DSH 插件目录（~/.dsh/speech-to-text/...），不重复下载。
 """
 
-import os, sys, json, hashlib, urllib.parse, urllib.request, ssl, time, re, struct, shutil, subprocess, tempfile
+import os, sys, json, hashlib, urllib.parse, urllib.request, urllib.error, ssl, time, re, struct, shutil, subprocess, tempfile
 
 # ============================================================
 # Configuration
@@ -297,7 +297,24 @@ def download_file(url, output_path, referer='https://www.bilibili.com/'):
             headers['Range'] = f'bytes={existing_size}-'
 
     req = urllib.request.Request(url, headers=headers)
-    resp = urllib.request.urlopen(req, timeout=600, context=SSL_CTX)
+    try:
+        resp = urllib.request.urlopen(req, timeout=600, context=SSL_CTX)
+    except urllib.error.HTTPError as e:
+        # 416 = 断点续传的 Range 越界。最常见的原因不是"文件坏了"，而是
+        # 上一次进程被杀时**音频其实已经下完**，本地文件是完整的，服务端却
+        # 认为 bytes=<size>- 越界。这时不能重试 Range，必须删掉本地文件从 0 重下。
+        if e.code == 416 and existing_size > 0:
+            print(f'  Range 越界（本地已有 {existing_size} 字节，多半是上次下完没记账），删除后整段重下')
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+            headers.pop('Range', None)
+            req = urllib.request.Request(url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=600, context=SSL_CTX)
+            existing_size = 0
+        else:
+            raise
 
     mode = 'ab' if existing_size > 0 else 'wb'
     with open(output_path, mode) as f:

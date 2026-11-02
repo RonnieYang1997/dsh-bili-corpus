@@ -46,7 +46,7 @@ interface PluginContext {
 // ─────────────────────────────────────────── 语料 profile（P0：配置文件驱动）
 const E = process.env
 const HOME = homedir().replace(/\\/g, '/')
-const WORKSPACE = E.DSH_CORPUS_WORKSPACE || 'C:/Users/Ronnie/Documents/deepseek-harness/default-workspace'
+const WORKSPACE = E.DSH_CORPUS_WORKSPACE || join(HOME, 'Documents', 'deepseek-harness', 'default-workspace')
 // P2a：清洗管线内嵌进插件（python/pipeline），不再依赖外部 _scratch / 技能目录。
 const PIPELINE = E.DSH_CORPUS_PIPELINE || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'pipeline')
 
@@ -58,10 +58,16 @@ type CorpusProfile = {
   id: string
   /** 稿件文件名前缀，例如 `dufu-`（bvid 模式下 文件名 = `${docPrefix}${bvid}.md`）。 */
   docPrefix: string
-  /** 命名策略：`bvid` = `<docPrefix><bvid>.md`（历史/独夫之心）；`title` = `<标题>-<bvid>.md`。 */
-  naming: 'bvid' | 'title'
-  /** title 模式的模板（默认 `{title}-{bvid}.md`）；bvid 模式忽略。 */
+  /**
+   * 命名策略：`bvid` = `<docPrefix><bvid>.md`（历史/独夫之心）；`title` = `<标题>-<bvid>.md`；
+   * `plain` = 只有标题（文件名里不带 BV 号，用于「001 篇名（讲者）.md」这类人工编号语料）。
+   * plain 模式靠 `docPattern` 认稿，靠 `state/docmap.json` 反查 bvid。
+   */
+  naming: 'bvid' | 'title' | 'plain'
+  /** title/plain 模式的模板（默认 `{title}-{bvid}.md`；plain 默认 `{title}.md`）。 */
   fileName: string
+  /** 认稿正则（空 = 走旧规则「文件名含 BV 号或带 docPrefix」）。plain 模式必填。 */
+  docPattern: string
   /** 每语料自己的索引文件（默认 MEMORY.md；空串 = 不维护索引）。 */
   indexFile: string
   landing: string
@@ -72,13 +78,19 @@ type CorpusProfile = {
   pythonAsr: string
 }
 
-/** 引擎路径（Python / 技能脚本）与语料数据路径无关，全局一份。 */
+/** 引擎路径（Python / 技能脚本）与语料数据路径无关，全局一份；全部按 HOME 推导，不写死用户名。 */
+const SKILLS_VENV = join(HOME, 'Documents', 'GitHub', 'Skills', 'bilibili-transcribe', '.venv', 'Scripts', 'python.exe')
 const ENGINE = {
-  python: E.DSH_CORPUS_PY || 'C:/Users/Ronnie/AppData/Local/Programs/Python/Python312/python.exe',
-  pythonAsr: E.DSH_CORPUS_ASR_PY
-    || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/.venv/Scripts/python.exe',
-  lintDir: E.DSH_CORPUS_LINT_DIR || PIPELINE
-    || 'C:/Users/Ronnie/AppData/Roaming/AionUi/aionui/conversations/aionrs-temp-5c938b2a/.aionrs/skills/bilibili-transcribe/scripts',
+  python: E.DSH_CORPUS_PY || firstExisting([
+    join(HOME, '.dsh', 'speech-to-text', 'venv', 'Scripts', 'python.exe'),
+    SKILLS_VENV,
+    join(HOME, 'AppData', 'Local', 'Programs', 'Python', 'Python312', 'python.exe'),
+  ]) || 'python',
+  pythonAsr: E.DSH_CORPUS_ASR_PY || firstExisting([
+    join(HOME, '.dsh', 'speech-to-text', 'venv', 'Scripts', 'python.exe'),
+    SKILLS_VENV,
+  ]) || SKILLS_VENV,
+  lintDir: E.DSH_CORPUS_LINT_DIR || PIPELINE,
 }
 
 /** 内置默认语料（env 单语料模式的等价物）。 */
@@ -88,9 +100,10 @@ function envProfile(): CorpusProfile {
     docPrefix: 'dufu-',
     naming: 'bvid',
     fileName: '{title}-{bvid}.md',
+    docPattern: '',
     indexFile: 'MEMORY.md',
     landing: E.DSH_CORPUS_MAIN || join(HOME, '.dsh', 'corpus', 'dufuzhixin', 'memory'),
-    archive: E.DSH_CORPUS_ARCHIVE || E.DSH_CORPUS_MIRROR || 'C:/Users/Ronnie/Documents/GitHub/dufuzhixin/memory',
+    archive: E.DSH_CORPUS_ARCHIVE || E.DSH_CORPUS_MIRROR || join(HOME, 'Documents', 'GitHub', 'dufuzhixin', 'memory'),
     state: E.DSH_CORPUS_STATE || join(HOME, '.dsh', 'corpus', 'dufuzhixin', '_smoothing_state'),
     lintDir: ENGINE.lintDir,
     python: ENGINE.python,
@@ -119,8 +132,9 @@ function loadProfiles(): Record<string, CorpusProfile> {
     if (!id || !raw || typeof raw !== 'object') continue
     const strs = Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'string' && v))
     const merged = { ...base, ...strs, id } as CorpusProfile
-    merged.naming = merged.naming === 'title' ? 'title' : 'bvid'
-    merged.fileName = merged.fileName || '{title}-{bvid}.md'
+    merged.naming = merged.naming === 'title' ? 'title' : merged.naming === 'plain' ? 'plain' : 'bvid'
+    merged.fileName = merged.fileName || (merged.naming === 'plain' ? '{title}.md' : '{title}-{bvid}.md')
+    merged.docPattern = String((raw as Record<string, any>).docPattern || '')
     out[id] = merged
   }
   PROFILES = out
@@ -189,7 +203,7 @@ function corporaSummary(): Record<string, unknown> {
     file: CORPORA_FILE,
     root: join(HOME, '.dsh', 'corpus'),
     corpora: Object.values(map).map((p) => ({
-      id: p.id, docPrefix: p.docPrefix, naming: p.naming, fileName: p.fileName, indexFile: p.indexFile,
+      id: p.id, docPrefix: p.docPrefix, naming: p.naming, fileName: p.fileName, docPattern: p.docPattern, indexFile: p.indexFile,
       landing: p.landing, archive: p.archive, state: p.state,
     })),
   }
@@ -204,6 +218,7 @@ type CorpusDraft = {
   id: string
   naming?: string
   docPrefix?: string
+  docPattern?: string
   indexFile?: string
   landing?: string
   archive?: string
@@ -285,7 +300,8 @@ function createCorpus(d: CorpusDraft): Record<string, unknown> {
   const entries = readCorporaEntries()
   entries[id] = {
     docPrefix: String(d.docPrefix || 'dufu-').trim() || 'dufu-',
-    naming: d.naming === 'title' ? 'title' : 'bvid',
+    naming: d.naming === 'title' ? 'title' : d.naming === 'plain' ? 'plain' : 'bvid',
+    docPattern: String(d.docPattern || '').trim(),
     indexFile,
     landing,
     archive,
@@ -306,11 +322,12 @@ function updateCorpus(d: CorpusDraft): Record<string, unknown> {
   const entries = readCorporaEntries()
   if (!entries[id]) {
     const p = map[id]
-    entries[id] = { docPrefix: p.docPrefix, naming: p.naming, indexFile: p.indexFile, landing: p.landing, archive: p.archive, state: p.state }
+    entries[id] = { docPrefix: p.docPrefix, naming: p.naming, docPattern: p.docPattern, indexFile: p.indexFile, landing: p.landing, archive: p.archive, state: p.state }
   }
   const cur = entries[id]
   const next = { ...cur }
-  if (d.naming !== undefined) next.naming = d.naming === 'title' ? 'title' : 'bvid'
+  if (d.naming !== undefined) next.naming = d.naming === 'title' ? 'title' : d.naming === 'plain' ? 'plain' : 'bvid'
+  if (d.docPattern !== undefined) next.docPattern = String(d.docPattern).trim()
   if (d.docPrefix !== undefined) next.docPrefix = String(d.docPrefix).trim() || cur.docPrefix || 'dufu-'
   if (d.indexFile !== undefined) next.indexFile = String(d.indexFile).trim()
   for (const k of ['landing', 'archive', 'state'] as const) {
@@ -364,8 +381,23 @@ function titleSlug(title: string): string {
   return cleaned.slice(0, 60) || 'untitled'
 }
 
-/** 稿件文件名：bvid 模式 = `<docPrefix><bvid>.md`；title 模式 = `<标题>-<bvid>.md`。 */
+/** plain 模式的人读文件名：只去非法字符，保留空格与中文标点（`001 《资本论》序言（马拥军）.md`）。 */
+function plainSlug(title: string): string {
+  const cleaned = String(title || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^\.+|\.+$/g, '')
+    .trim()
+  return cleaned.slice(0, 120) || 'untitled'
+}
+
+/** 稿件文件名：bvid 模式 = `<docPrefix><bvid>.md`；title 模式 = `<标题>-<bvid>.md`；plain = `<标题>.md`。 */
 function docNameFor(id: string, title?: string | null, p: CorpusProfile = P()): string {
+  if (p.naming === 'plain' && title) {
+    const tpl = p.fileName || '{title}.md'
+    const name = tpl.split('{title}').join(plainSlug(title)).split('{bvid}').join(id)
+    return name.endsWith('.md') ? name : `${name}.md`
+  }
   if (p.naming === 'title' && title) {
     const tpl = p.fileName || '{title}-{bvid}.md'
     const name = tpl.split('{title}').join(titleSlug(title)).split('{bvid}').join(id)
@@ -374,17 +406,45 @@ function docNameFor(id: string, title?: string | null, p: CorpusProfile = P()): 
   return `${p.docPrefix}${id}.md`
 }
 
-/** 是不是一篇转写稿：.md 且名字里带 BV 号（任何命名策略都满足），或带该语料前缀。 */
+/**
+ * 是不是一篇转写稿：有 `docPattern` 就按正则认（plain 模式靠它）；
+ * 否则沿用旧规则「文件名含 BV 号或带该语料前缀」。
+ */
 function isDocName(file: string, p: CorpusProfile = P()): boolean {
+  if (p.docPattern) {
+    try { return new RegExp(p.docPattern).test(file) } catch { /* 正则有误 → 退旧规则 */ }
+  }
   return file.endsWith('.md') && (BV_TOKEN.test(file) || (p.docPrefix !== '' && file.startsWith(p.docPrefix)))
 }
 
-/** 在某个目录里按 bvid 找稿（命名策略无关：只要文件名里有 BV 号）。 */
-function findDocIn(root: string, bvid: string): string | null {
+/**
+ * 语料内 bvid ↔ 文件名对照（plain/title 模式文件名里没有 BV 号，必须靠这张表反查）。
+ * 存 `<state>/docmap.json`：{ "<bvid>": "<文件名>" }；缺席时静默返回空表。
+ */
+function docMapPath(p: CorpusProfile = P()): string {
+  return join(p.state, 'docmap.json')
+}
+function readDocMap(p: CorpusProfile = P()): Record<string, string> {
+  return readJsonFile<Record<string, string>>(docMapPath(p), {})
+}
+function writeDocMapEntry(bvid: string, fileName: string, p: CorpusProfile = P()): void {
+  if (!bvid || !fileName) return
+  try {
+    const map = readDocMap(p)
+    if (map[bvid] === fileName) return
+    map[bvid] = fileName
+    writeJson(docMapPath(p), map)
+  } catch { /* 对照表写不进不致命：只是缓存查找退化为「按标题猜」 */ }
+}
+
+/** 在某个目录里按 bvid 找稿：先看名字里有没有 BV 号，再查 docmap。 */
+function findDocIn(root: string, bvid: string, p: CorpusProfile = P()): string | null {
   try {
     for (const f of readdirSync(root)) {
       if (f.endsWith('.md') && f.includes(bvid)) return join(root, f)
     }
+    const mapped = readDocMap(p)[bvid]
+    if (mapped && mapped.endsWith('.md') && existsSync(join(root, mapped))) return join(root, mapped)
   } catch { /* 目录不存在 */ }
   return null
 }
@@ -408,7 +468,7 @@ function resolveBiliPython(): string {
     E.DSH_BILI_PY,
     BILI_SKILL_DIR ? join(BILI_SKILL_DIR, '.venv', 'Scripts', 'python.exe') : '',
     join(HOME, '.dsh', 'speech-to-text', 'venv', 'Scripts', 'python.exe'),
-    'C:/Users/Ronnie/AppData/Local/Programs/Python/Python312/python.exe',
+    join(HOME, 'AppData', 'Local', 'Programs', 'Python', 'Python312', 'python.exe'),
   ]
   for (const c of cands) if (c && existsSync(c)) return c
   return E.DSH_BILI_PY || ''
@@ -418,9 +478,9 @@ const PY_BILI = resolveBiliPython()
 const BRIDGE = E.DSH_BILI_BRIDGE || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'bridge.py')
 // 本地模型（已备好，插件只做存在性检查，绝不自动下载——SKILL.md 明令）。
 const BILI_MODEL_DIR = E.DSH_BILI_MODEL_DIR
-  || 'C:/Users/Ronnie/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx'
+  || join(HOME, '.dsh', 'speech-to-text', 'sensevoice', 'models', 'sensevoice-onnx')
 const BILI_VAD_MODEL = E.DSH_BILI_VAD_MODEL
-  || 'C:/Users/Ronnie/.dsh/speech-to-text/sensevoice/models/silero/silero_vad.onnx'
+  || join(HOME, '.dsh', 'speech-to-text', 'sensevoice', 'models', 'silero', 'silero_vad.onnx')
 // ffmpeg/ffprobe：P1 起优先用 ~/.dsh/speech-to-text/ffmpeg（已从会话目录搬出来），
 // 再回退外部技能目录上溯；缺 ffprobe 会被 bridge 直接拦下（静默 300s 预览是历史事故）。
 function firstExisting(paths: Array<string | undefined>): string {
@@ -530,6 +590,8 @@ function run(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: numb
       DSH_CORPUS_PATCHES: patchRoot(),
       DSH_CORPUS_ID: P().id,
       DSH_CORPUS_DOC_PREFIX: P().docPrefix,
+      // P4：人工编号语料靠这条正则认稿（空串 = 走旧的 dufu- 前缀规则）。
+      DSH_CORPUS_DOC_PATTERN: P().docPattern,
       DSH_CORPUS_ASR_RAW: join(dirname(P().state), '_asr_raw'),
       DSH_CORPUS_LINT_BASELINE: lintBaseline(),
     },
@@ -574,7 +636,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             docPrefix: 'dufu-',
             indexFile: 'MEMORY.md',
             landing: join(HOME, '.dsh', 'corpus', 'dufuzhixin', 'memory'),
-            archive: 'C:/Users/Ronnie/Documents/GitHub/dufuzhixin/memory',
+            archive: join(HOME, 'Documents', 'GitHub', 'dufuzhixin', 'memory'),
             state: join(HOME, '.dsh', 'corpus', 'dufuzhixin', '_smoothing_state'),
           },
           demo: {
@@ -584,6 +646,27 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             landing: join(HOME, '.dsh', 'corpus', 'demo', 'memory'),
             archive: join(HOME, 'Documents', 'GitHub', 'demo-corpus', 'memory'),
             state: join(HOME, '.dsh', 'corpus', 'demo', '_smoothing_state'),
+          },
+          // 人工编号语料（本机在用）：文件名形如 `001 篇名·卷次（讲者）.md`，不带 BV 号。
+          malie: {
+            docPrefix: '',
+            naming: 'plain',
+            fileName: '{title}.md',
+            docPattern: '^[0-9]{3} .+\\.md$',
+            indexFile: '',
+            landing: join(HOME, '.dsh', 'corpus', 'malie', 'memory'),
+            archive: join(HOME, 'Desktop', '马列文集'),
+            state: join(HOME, '.dsh', 'corpus', 'malie', '_smoothing_state'),
+          },
+          capital: {
+            docPrefix: '',
+            naming: 'plain',
+            fileName: '{title}.md',
+            docPattern: '^[0-9]{3} .+\\.md$',
+            indexFile: '',
+            landing: join(HOME, '.dsh', 'corpus', 'capital', 'memory'),
+            archive: join(HOME, 'Desktop', '资本论'),
+            state: join(HOME, '.dsh', 'corpus', 'capital', '_smoothing_state'),
           },
         },
       }
@@ -732,6 +815,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
     ensureIndexLine(P().landing, bvid, fileName)
     ensureIndexLine(P().archive, bvid, fileName)
+    // plain/title 模式文件名里没有 BV 号：记一张 bvid → 文件名 对照表，缓存查找与开批都靠它。
+    if (P().naming !== 'bvid') writeDocMapEntry(bvid, fileName)
     return { archived, kept }
   }
 
@@ -1624,8 +1709,9 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       properties: {
         action: { type: 'string', enum: ['create', 'update', 'delete'], description: 'create=新建，update=编辑，delete=删除' },
         id: { type: 'string', description: '语料 id（小写字母/数字/-/_，1–32 位；update/delete 必填）' },
-        naming: { type: 'string', enum: ['bvid', 'title'], description: '命名策略：bvid=`dufu-<bvid>.md`；title=`<标题>-<bvid>.md`' },
+        naming: { type: 'string', enum: ['bvid', 'title', 'plain'], description: '命名策略：bvid=`dufu-<bvid>.md`；title=`<标题>-<bvid>.md`；plain=`<标题>.md`（人工编号语料，靠 docPattern 认稿）' },
         docPrefix: { type: 'string', description: 'bvid 模式的文件名前缀（默认 dufu-）' },
+        docPattern: { type: 'string', description: '认稿正则（空=旧规则「含 BV 号或带前缀」）；plain 模式必填，如 `^[0-9]{3} .+\\.md$`' },
         indexFile: { type: 'string', description: '索引文件名（默认 MEMORY.md；空串 = 不维护索引）' },
         landing: { type: 'string', description: '新稿落点目录（绝对路径；缺省 ~/.dsh/corpus/<id>/memory）' },
         archive: { type: 'string', description: '产物存档目录（绝对路径，create 必填）' },
@@ -1643,6 +1729,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         id: String(args?.id ?? ''),
         naming: args?.naming === undefined ? undefined : String(args.naming),
         docPrefix: args?.docPrefix === undefined ? undefined : String(args.docPrefix),
+        docPattern: args?.docPattern === undefined ? undefined : String(args.docPattern),
         indexFile: args?.indexFile === undefined ? undefined : String(args.indexFile),
         landing: args?.landing === undefined ? undefined : String(args.landing),
         archive: args?.archive === undefined ? undefined : String(args.archive),
@@ -1739,12 +1826,12 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       const corpusId = typeof args?.corpus === 'string' ? args.corpus : undefined
       const prof = profileOf(corpusId)
       let name = typeof args?.name === 'string' && args.name.trim() ? args.name.trim() : null
+      // 文件名要不要带 BV 号跟着命名策略走：plain = 人工编号语料（`001 篇名（讲者）.md`），不带 BV 号
       if (name && !/\.md$/i.test(name)) name += '.md'
-      // 文件名必须带 BV 号（否则缓存命中 / 回查 / 门禁都认不出它）
-      if (name && !name.includes(bvid)) name = `${name.replace(/\.md$/i, '')}-${bvid}.md`
+      if (name && prof.naming !== 'plain' && !name.includes(bvid)) name = `${name.replace(/\.md$/i, '')}-${bvid}.md`
 
       const wantPropose = args?.propose === true
-      if (!name && (wantPropose || prof.naming === 'title')) {
+      if (!name && (wantPropose || prof.naming !== 'bvid')) {
         const meta = proposeBili(bvid)
         const suggested = docNameFor(bvid, meta.ok ? meta.title : null, prof)
         if (wantPropose) {
@@ -1757,9 +1844,9 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             title: meta.title ?? null,
             duration: meta.duration ?? null,
             suggested,
-            hint: prof.naming === 'title'
-              ? '把 name 设成确认后的文件名（或直接用 suggested）再调一次，就开始转写'
-              : '这是 bvid 式语料，name 可以省略；想按标题命名就显式传 name',
+            hint: prof.naming === 'bvid'
+              ? '这是 bvid 式语料，name 可以省略；想按标题命名就显式传 name'
+              : '把 name 设成确认后的文件名（或直接用 suggested）再调一次，就开始转写',
             error: meta.ok ? undefined : meta.error,
           }, null, 2)
         }
@@ -1771,7 +1858,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
           naming: prof.naming,
           title: meta.title ?? null,
           suggested,
-          hint: `「${prof.id}」是标题式语料：请先跟用户确认文件名（建议 ${suggested}），再带 name=<文件名> 重新调用`,
+          hint: `「${prof.id}」是按标题命名的语料（naming=${prof.naming}）：请先跟用户确认文件名（建议 ${suggested}），再带 name=<文件名> 重新调用`,
           error: meta.ok ? undefined : meta.error,
         }, null, 2)
       }
@@ -1991,6 +2078,46 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     output: textOutput,
     async execute() {
       return JSON.stringify(runGates(), null, 2)
+    },
+  })
+
+  register({
+    name: 'corpus_dict',
+    description: '确定性词典通道（0 token，可复算）：用 TSV 规则表（键\\t值\\t依据；长键优先、跑到不动点、cap 8 遍）批量修稿。action=check 静态体检（重复键 / 自食 / 单字键 / 全库零命中）；verify 只统计全库能改多少处；apply 真落地（先备份到 <STATE>/_dict_backup/<时间戳>/，默认 dryRun=true 只预览）。返回 JSON。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['check', 'verify', 'apply'], description: 'check=体检；verify=只统计；apply=落地（默认预览）' },
+        rules: { type: 'string', description: '规则文件路径（逗号分隔）；缺省读 <STATE>/dict/*.tsv' },
+        dryRun: { type: 'boolean', description: 'apply 时缺省 true（只预览不写）' },
+        only: { type: 'string', description: '只处理这些稿件 id（逗号分隔，前缀匹配）' },
+        sample: { type: 'integer', description: '明细展示篇数（默认 10）' },
+        force: { type: 'boolean', description: 'apply 时跳过自食拦截（会把稿子改坏，慎用）' },
+        strictMiss: { type: 'boolean', description: 'check 时把「零命中」当失败（单讲专属表用；跨讲底表别开）' },
+        merge: { type: 'boolean', description: '多张表一起喂时重复键先到先得（默认报错）' },
+      },
+      required: ['action'],
+    },
+    output: textOutput,
+    async execute(args: Record<string, any>) {
+      const action = String(args?.action ?? '').trim()
+      if (!['check', 'verify', 'apply'].includes(action)) {
+        return JSON.stringify({ ok: false, error: 'BAD_ARGS', message: 'action 必须是 check / verify / apply' }, null, 2)
+      }
+      const argv = ['dict_apply.py', action]
+      if (args?.rules) argv.push('--rules', String(args.rules))
+      if (action === 'check' && args?.strictMiss === true) argv.push('--strict-miss')
+      if (args?.merge === true) argv.push('--merge')
+      if (action !== 'check' && args?.sample !== undefined) argv.push('--sample', String(Number(args.sample)))
+      if (action === 'apply') {
+        if (args?.only) argv.push('--only', String(args.only))
+        if (args?.dryRun !== false) argv.push('--dry-run')
+        if (args?.force === true) argv.push('--force')
+      }
+      const r = run(P().python, argv, { cwd: PIPELINE, timeoutMs: 1800000 })
+      const ok = r.rc === 0
+      log(`dict ${action} rc=${r.rc}`)
+      return JSON.stringify({ ok, at: nowIso(), corpus: P().id, action, rc: r.rc, ms: r.ms, error: r.error, out: r.out.slice(-20000) }, null, 2)
     },
   })
 

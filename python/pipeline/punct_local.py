@@ -152,7 +152,7 @@ def main():
     t_all = time.time()
     for x in todo:
         b = x["bvid"]
-        p = os.path.join(MAIN, "%s%s.md" % (_cp.DOC_PREFIX, b))
+        p = _cp.doc_path(b, MAIN)
         raw = open(p, "rb").read()
         t = raw.decode("utf-8-sig")
         m = FM.match(t)

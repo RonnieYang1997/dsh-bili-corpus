@@ -71,7 +71,7 @@ def alnum_token(text):
 
 def apply_one(bvid, spec, dry_run, drop_bad=False, snap=None, allow_name_digits=False,
               allow_name_digits_strong=False):
-    name = "%s%s.md" % (_cp.DOC_PREFIX, bvid)
+    name = _cp.doc_name(bvid)
     pm, pr = _cp.doc_by_name(name), os.path.join(MIRROR, name)
     res = {"bvid": bvid, "ok": False, "patches": 0, "applied": [], "dropped": [],
            "redundant": [], "warnings": [], "errors": []}

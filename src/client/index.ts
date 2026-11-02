@@ -598,15 +598,10 @@ function CockpitPanel(): ReactElement {
 }
 
 export function apply(ctx: ClientContext): void {
+  // `register({` 的 `{` 必须紧跟括号：注入器用 /register\(\{[\s\S]*?name:\s*'slot'/ 校验骨架，
+  // 写成 register(\n { 会被判「缺合法 name」并阻断注入（2026-11-02 实测）。
   const mount = (): unknown =>
-    ctx.slots.register(
-      {
-        name: 'conversation.view',
-        id: 'dsh-bili-corpus-panel',
-        label: () => 'B站语料',
-      },
-      CockpitPanel,
-    )
+    ctx.slots.register({ name: 'conversation.view', id: 'dsh-bili-corpus-panel', label: () => 'B站语料' }, CockpitPanel)
 
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => ctx.slots.inject('conversation.view', mount), 'dsh-bili-corpus: panel')

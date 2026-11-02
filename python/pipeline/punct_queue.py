@@ -53,9 +53,9 @@ for eb in a.exclude_batch:
         skip |= got
         print("排除批次 %d 的 %d 篇" % (eb, len(got)))
 for f in sorted(_cp.iter_names()):
-    if not (f.startswith(_cp.DOC_PREFIX) and f.endswith(".md")):
+    if not _cp.is_doc(f):
         continue
-    b = f[5:-3]
+    b = _cp.stem(f)
     if b in skip:
         continue
     if not a.all and led["punct"].get(b, {}).get("status") == "done":
@@ -67,7 +67,7 @@ for f in sorted(_cp.iter_names()):
 todo.sort(key=lambda x: -x["maxrun"])
 batch = todo[:a.n]
 qd = os.path.join(STATE, "punct-queue-batch-%d.json" % a.batch)
-ROOT = r"C:\Users\Ronnie\Documents\deepseek-harness\default-workspace\_scratch\_punct"
+ROOT = os.path.join(_cp.STATE, "_punct")
 os.makedirs(ROOT, exist_ok=True)
 for x in batch:
     # 每篇一个**私有目录**：代理只在这里写，避免它们互相"清理"对方产出（已踩坑）
@@ -79,7 +79,7 @@ for x in batch:
 json.dump(batch, open(qd, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 snap = {}
 for x in batch:
-    n = "%s%s.md" % (_cp.DOC_PREFIX, x["bvid"])
+    n = _cp.doc_name(x["bvid"])
     snap[x["bvid"]] = {"main": hashlib.sha256(open(_cp.doc_by_name(n), "rb").read()).hexdigest(),
                        "mirror": hashlib.sha256(open(os.path.join(MIR, n), "rb").read()).hexdigest()}
 sf = os.path.join(STATE, "snap-punct-%d.json" % a.batch)

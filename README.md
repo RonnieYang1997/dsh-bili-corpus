@@ -48,7 +48,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 旧的 `dsh-corpus-cockpit` 已卸载：本插件用同名 `corpus_*` 工具接管，状态/台账路径不变，
 因此 180 批历史与门禁状态都继承下来。
 
-## 工具（11 个）
+## 工具（13 个）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -61,7 +61,8 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `corpus_mirror_sync {dryRun?}` | 把落点里的稿补进「产物存档」（内容不同才覆盖、缺的补、存档多出的只报告）。默认 dryRun=true。 |
 | `corpus_hydrate {dryRun?, limit?}` | 反向补齐：把存档里有、落点里没有的稿复制回落点（旧稿要在落点开批前先补齐）。默认 dryRun=true 只报告。 |
 | `corpus_use {id?}` | 不带 id = 列出全部语料与当前生效语料；带 id = 切换（写 `~/.dsh/corpus/active-corpus.json`，重载插件后保持）。批次/转写在跑时拒绝。 |
-| `corpus_manage {action, id, naming?, landing?, archive?, state?, docPrefix?, indexFile?, confirm?}` | 新建 / 编辑 / 删除语料（写 `corpora.json` 并建目录）。`action=delete` 必须 `confirm:true`；删除只删配置、目录保留；内置语料、生效语料、目录里还有带 BV 号稿件的语料都会被拒。批次/转写在跑时 BUSY。 |
+| `corpus_manage {action, id, naming?, landing?, archive?, state?, docPrefix?, docPattern?, indexFile?, confirm?}` | 新建 / 编辑 / 删除语料（写 `corpora.json` 并建目录）。`naming` 可为 `bvid` / `title` / `plain`；`plain` 必须给 `docPattern`（正则认稿，如 `^[0-9]{3} .+\.md$`）。`action=delete` 必须 `confirm:true`；删除只删配置、目录保留；内置语料、生效语料、目录里还有带 BV 号稿件的语料都会被拒。批次/转写在跑时 BUSY。 |
+| `corpus_dict {action, rules?, dryRun?, only?, sample?, force?, strictMiss?, merge?}` | **确定性词典通道（0 token）**：喂 TSV 规则表（`键\t值\t依据`）批量修稿，长键优先、跑到不动点（cap 8 遍）。`check` 体检（重复键 / 自食 / 单字键 / 零命中）、`verify` 只统计能改多少处、`apply` 落地（先备份到 `<STATE>/_dict_backup/<时间戳>/`，**默认 dryRun=true**）。`rules` 可给逗号分隔的文件或**目录**（跨讲累积表一起喂要 `merge:true`，重复键先到先得）。 |
 
 ## HTTP 端点
 
@@ -122,7 +123,9 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `DSH_CORPUS_ID` | 宿主自动传：把语料 id 打进台账批次记录（`corpus` 字段），便于排查串库 |
 | `DSH_CORPUS_AUTO` | `false`（不自动跑批） |
 | `DSH_CORPUS_MIN_TRANSCRIPTS` | `1000`（lint 的 R20 目录可信度阈值；demo 这类小语料靠 `no-git-operations.md` 标记放行） |
-| `DSH_CORPUS_DOC_PREFIX` | `dufu-`（宿主导出给清洗脚本；命名策略另有 `naming: bvid|title`） |
+| `DSH_CORPUS_DOC_PREFIX` | `dufu-`（宿主导出给清洗脚本；命名策略另有 `naming: bvid|title|plain`；显式空串会被保留，不会回落默认值） |
+| `DSH_CORPUS_DOC_PATTERN` | 空（宿主自动传语料的 `docPattern`）。设了它，`paths.is_doc()/stem()/doc_name()` 改用正则认稿，人工编号语料靠这个跑清洗 |
+| `DSH_CORPUS_DICT` | 空（`corpus_dict` 的规则文件路径，`os.pathsep` 分隔；缺省读 `<STATE>/dict/*.tsv`） |
 
 ## 转写引擎（P1：已内嵌，2026-10-31）
 
@@ -215,6 +218,58 @@ demo 语料真批次（非 dryRun）也跑通：批 3 → queue 4 → 补丁 7 �
 索引行也接受任意 `- <stem>`（`dufu-BV...` 与 `标题-BV...` 等价）。`corpus_lint_selftest.py` 的
 fixture 已改成合法 BV 号，`SELFTEST PASS`。
 
+
+## 人工编号语料（naming=`plain`）
+
+不是所有合集都能拿 BV 号当文件名。人工编号的语料长这样：
+
+```
+001 《黑格尔法哲学批判导言》导读（马拥军）.md
+002 《论犹太人问题》导读（上）（马拥军）.md
+```
+
+配法（`corpora.json` 或 `corpus_manage`）：
+
+```json
+{
+  "naming": "plain",
+  "fileName": "{title}.md",
+  "docPattern": "^[0-9]{3} .+\\.md$",
+  "docPrefix": "",
+  "indexFile": ""
+}
+```
+
+- `docPattern` 是**认稿的唯一依据**：哪些 md 算稿件、哪些是说明文档，全看它。目录里放一份 `_续做指南.md` 不会被算进篇数。
+- 稿件 id（台账、队列、补丁里用的 `bvid` 字段）在 plain 模式下 = 文件名去 `.md`。
+- 文件名里没有 BV 号，所以反查靠 `<STATE>/docmap.json`（归档时自动写 `{bvid: 文件名}`），`bili_discover` 判断"这集做没做过"也读它。
+- python 侧的对应开关是 `DSH_CORPUS_DOC_PATTERN`（`paths.is_doc()` / `paths.stem()` / `paths.doc_name()`），host 会自动把语料配置注入子进程。
+- 拼文件名用 `plainSlug()`：只清 `\ / : * ? " < > |` 和控制字符，**保留空格与中文标点**（中文标题里的书名号、逗号都是内容）。
+
+## 确定性词典通道（`corpus_dict`）
+
+LLM 逐篇出补丁那条线（`corpus_batch`）贵、不可复算、同一个错会反复犯。人工校订积累下来的
+规则表是**确定性**的：一条规则就是一个「走音 → 正确」的断言，只要有据可依，跑多少遍结果都一样。
+
+规则文件（TSV，`#` 开头为注释）：
+
+```
+马克思格斯	马克思恩格斯	历史累积：45 讲 146 次
+资产阶义	资产阶级	吞"级"
+。本家为自己的利润而斗争	。资本家为自己的利润而斗争	键吃自己 → 前移真实左邻字
+```
+
+四条纪律（都是踩坑换来的）：
+
+1. **长键优先**：同一位置先吃长的。否则 `资产阶` 会把 `资产阶级` 的头部吃掉，长键永远不触发。
+2. **不许自食**（键含于值）：`黑格 → 黑格尔` 每遍都会再长一个"尔"，永不收敛。`check` / `apply` 会直接拦下，`--force` 才放行。解药是前移真实左邻字（`。黑格`），**不是**加空转守卫。
+3. **不许重复键**：同一键出现两次说明两张表在打架。跨讲累积表一起喂时加 `merge`（先到先得），否则报错。
+4. **跑到不动点**：单遍替换后还有新命中就再来一遍，上限 8 遍；跑满 8 遍还在变 = 表坏了，直接返回 rc=3。
+
+`apply` 默认只试跑，并且会打印**改前上下文**（键在 `【】` 里 + 前后各 14 字）——先看句子，
+再决定要不要落地。落地前把原文件备份到 `<STATE>/_dict_backup/<时间戳>/`，改完可以逐字节回滚。
+
+和 LLM 通道的分工：**词典通道先跑**（0 token、可复算），剩下的新走音才交给 `corpus_batch`。
 
 ## 已知坑（都是踩过的）
 
