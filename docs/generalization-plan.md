@@ -156,7 +156,10 @@ glob 规则：`docPrefix` 参与扫描（`^<prefix>.+\.md$`），索引行形模
 2. `MEMORY.md` 索引是硬需求，还是允许换成 JSON 清单（`indexFile: ""` 时）？
 3. Python 环境怎么带：插件自带 venv（干净但体积/安装慢）还是要求系统 Python + `pip install -r requirements.txt`？
 4. 是否只支持 Windows？（现在路径、ffmpeg、`.exe` 全是 Windows 形态）
-5. 校正用的 LLM prompt / 专名表（`glossary`）是否也要按 corpus 分文件？
+5. ~~校正用的 LLM prompt / 专名表（`glossary`）是否也要按 corpus 分文件？~~
+   **已答（2026-11-02）**：要，并且做成三层 —— 插件内置 `rules/curated.tsv`（跨语料通用）+
+   语料级 `rules/corpora/<id>.tsv`（按话题核心内容分）+ 讲授级 `<STATE>/dict/*.tsv`（用完即弃）。
+   LLM 通道（`corpus_batch`）的 prompt 仍不分文件，专名一律走确定性词典通道先跑。
 6. 分发形态：私有注入 / `npm pack` 的 tgz / 公开仓库？影响 P2 打包策略。
 
 ## 8. 建议顺序

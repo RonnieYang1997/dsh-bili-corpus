@@ -2083,18 +2083,18 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   register({
     name: 'corpus_dict',
-    description: '确定性词典通道（0 token，可复算）：用 TSV 规则表（键\\t值\\t依据；长键优先、跑到不动点、cap 8 遍）批量修稿。action=check 静态体检（重复键 / 自食 / 单字键 / 全库零命中）；verify 只统计全库能改多少处；apply 真落地（先备份到 <STATE>/_dict_backup/<时间戳>/，默认 dryRun=true 只预览）。返回 JSON。',
+    description: '确定性词典通道（0 token，可复算）：用 TSV 规则表（键\\t值\\t依据；长键优先、跑到不动点、cap 8 遍）批量修稿。不带 rules 时按三层叠加：插件内置 curated.tsv（跨语料通用）→ rules/corpora/<id>.tsv（语料级）→ <STATE>/dict/*.tsv（讲授级，用完即弃）。action=check 静态体检（重复键 / 自食 / 单字键 / 全库零命中）；verify 只统计全库能改多少处；apply 真落地（先备份到 <STATE>/_dict_backup/<时间戳>/，默认 dryRun=true 只预览）。返回 JSON。',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['check', 'verify', 'apply'], description: 'check=体检；verify=只统计；apply=落地（默认预览）' },
-        rules: { type: 'string', description: '规则文件路径（逗号分隔）；缺省读 <STATE>/dict/*.tsv' },
+        rules: { type: 'string', description: '规则文件路径（逗号分隔）；给了就只用这些，缺省走三层叠加（内置 curated → 语料级 → 讲授级 <STATE>/dict/*.tsv）' },
         dryRun: { type: 'boolean', description: 'apply 时缺省 true（只预览不写）' },
         only: { type: 'string', description: '只处理这些稿件 id（逗号分隔，前缀匹配）' },
         sample: { type: 'integer', description: '明细展示篇数（默认 10）' },
         force: { type: 'boolean', description: 'apply 时跳过自食拦截（会把稿子改坏，慎用）' },
         strictMiss: { type: 'boolean', description: 'check 时把「零命中」当失败（单讲专属表用；跨讲底表别开）' },
-        merge: { type: 'boolean', description: '多张表一起喂时重复键先到先得（默认报错）' },
+        merge: { type: 'boolean', description: '多张表一起喂时重复键先到先得（默认报错；走三层叠加时自动开）' },
       },
       required: ['action'],
     },
@@ -2107,7 +2107,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       const argv = ['dict_apply.py', action]
       if (args?.rules) argv.push('--rules', String(args.rules))
       if (action === 'check' && args?.strictMiss === true) argv.push('--strict-miss')
-      if (args?.merge === true) argv.push('--merge')
+      // 三层叠加时同键可能重复（讲授级覆盖语料级），默认合并不报错；显式 --rules 仍严格。
+      if (args?.merge === true || !args?.rules) argv.push('--merge')
       if (action !== 'check' && args?.sample !== undefined) argv.push('--sample', String(Number(args.sample)))
       if (action === 'apply') {
         if (args?.only) argv.push('--only', String(args.only))

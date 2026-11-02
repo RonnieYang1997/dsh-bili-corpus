@@ -41,14 +41,52 @@ import paths as _cp
 
 MAX_PASSES = 8
 
+# ---------------------------------------------------------------- 内置规则表
+# 规则分三层，加载顺序即下面的顺序：
+#   1. 插件内置   <plugin>/python/pipeline/rules/curated.tsv
+#                 跨语料通用：换个语境也不会咬到正常词（每条都验过上下文）
+#   2. 语料级     <plugin>/python/pipeline/rules/corpora/<id>.tsv
+#                 按话题核心内容分（malie 马恩文集 / capital 资本论 / dufuzhixin …）
+#   3. 讲授级     <STATE>/dict/*.tsv
+#                 单讲专属、用完即弃；同名键以这里的为准（后加载 + --merge 先到先得
+#                 时请把临时表放前面，或用 --rules 显式指定顺序）
+_HERE = os.path.dirname(os.path.abspath(__file__))
+RULES_DIR = os.environ.get("DSH_CORPUS_RULES") or os.path.join(_HERE, "rules")
+
+
+def corpus_id():
+    """当前语料 id：优先 env DSH_CORPUS_ID，其次从 <corpus>/<id>/_smoothing_state 反推。"""
+    cid = (os.environ.get("DSH_CORPUS_ID") or "").strip()
+    if cid:
+        return cid
+    st = os.path.abspath(_cp.STATE)
+    parent = os.path.dirname(st)
+    return os.path.basename(parent) if parent else ""
+
+
+def builtin_rule_paths():
+    """插件自带的两层：curated 永远先跑，语料级按当前语料 id 取。"""
+    out = []
+    cur = os.path.join(RULES_DIR, "curated.tsv")
+    if os.path.exists(cur):
+        out.append(cur)
+    cid = corpus_id()
+    if cid:
+        per = os.path.join(RULES_DIR, "corpora", "%s.tsv" % cid)
+        if os.path.exists(per):
+            out.append(per)
+    return out
+
 
 # ---------------------------------------------------------------- 规则装载
 def load_rules(paths, merge=False, min_key=1):
     """读若干 TSV → [(key, val, src)]，按长键优先排序；重复键直接报错。"""
     rules, seen, dups = [], {}, []
+    per_file = []
     for p in paths:
         if not os.path.exists(p):
             raise SystemExit("!! 规则文件不存在: %s" % p)
+        n_here = 0
         with open(p, "r", encoding="utf-8-sig") as f:
             for ln, line in enumerate(f, 1):
                 line = line.rstrip("\r\n")
@@ -67,6 +105,11 @@ def load_rules(paths, merge=False, min_key=1):
                     continue
                 seen[key] = "%s:%d" % (p, ln)
                 rules.append((key, val, parts[2] if len(parts) > 2 else ""))
+                n_here += 1
+        per_file.append((p, n_here))
+    if per_file:
+        print("规则层：%s" % " · ".join(
+            "%s %d条" % (os.path.basename(p), n) for p, n in per_file if n))
     if dups:
         if merge:
             print("合并去重：%d 条重复键保留首次出现（跨讲累积表正常现象）" % len(dups))
@@ -287,14 +330,16 @@ def split_rules(s):
                 out.append(x)
         return out
     env = os.environ.get("DSH_CORPUS_DICT") or ""
-    paths = [x.strip() for x in env.split(os.pathsep) if x.strip()]
-    if not paths:
-        d = os.path.join(_cp.STATE, "dict")
-        if os.path.isdir(d):
-            paths = [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".tsv")]
-    if not paths:
-        raise SystemExit("!! 没有规则文件：--rules a.tsv 或 DSH_CORPUS_DICT，或 <STATE>/dict/*.tsv")
-    return paths
+    out = builtin_rule_paths()
+    out.extend(x.strip() for x in env.split(os.pathsep) if x.strip())
+    d = os.path.join(_cp.STATE, "dict")
+    if os.path.isdir(d):
+        out.extend(os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".tsv"))
+    if not out:
+        raise SystemExit(
+            "!! 没有规则文件：内置表目录 %s 不存在，且 %s 下没有 *.tsv。\n"
+            "   显式指定：--rules a.tsv[,b.tsv…]" % (RULES_DIR, d))
+    return out
 
 
 def main():
