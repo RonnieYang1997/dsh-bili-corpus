@@ -66,6 +66,8 @@ SSL_CTX.verify_mode = ssl.CERT_NONE
 def _find_ffmpeg():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     for candidate in [
+        # 本机已备好的一份（P1 起 ffmpeg/ffprobe 都搬到 DSH 家目录，不再依赖会话目录）
+        os.path.join(os.path.expanduser('~'), '.dsh', 'speech-to-text', 'ffmpeg', 'ffmpeg.exe'),
         os.path.join(script_dir, '..', '..', '..', '..', 'ffmpeg.exe'),
         os.path.join(script_dir, '..', 'ffmpeg.exe'),
         os.path.join(os.getcwd(), 'ffmpeg.exe'),
@@ -76,6 +78,22 @@ def _find_ffmpeg():
     return 'ffmpeg'
 
 FFMPEG = _find_ffmpeg()
+
+
+def _ffprobe_path():
+    """ffprobe 与 ffmpeg 同目录同基名。
+
+    注意：**只能换基名，不能对整串做 replace**——本机目录就叫 `ffmpeg`
+    （`~/.dsh/speech-to-text/ffmpeg/ffmpeg.exe`），整串替换会把目录也改成
+    `ffprobe`，得到不存在的 `.../ffprobe/ffprobe.exe`，子进程直接
+    `FileNotFoundError [WinError 2]`（2026-11-02 长稿转写失败的根因）。
+    """
+    head, base = os.path.split(FFMPEG)
+    probe = base.replace('ffmpeg', 'ffprobe')
+    cand = os.path.join(head, probe) if head else probe
+    if os.path.isfile(cand) or (not head and shutil.which(cand)):
+        return cand
+    return shutil.which('ffprobe') or cand
 
 
 # R22: never let an ffmpeg/ffprobe child stall a whole batch.
@@ -123,7 +141,7 @@ def run_capture(cmd, timeout=60, tag=""):
 
 def ffprobe_duration(file_path, timeout=60):
     """Duration in seconds via ffprobe (pipe-free)."""
-    probe = FFMPEG.replace("ffmpeg.exe", "ffprobe.exe").replace("ffmpeg", "ffprobe")
+    probe = _ffprobe_path()
     out = run_capture([probe, "-v", "error", "-show_entries", "format=duration",
                        "-of", "default=noprint_wrappers=1:nokey=1", file_path],
                       timeout=timeout, tag="ffprobe " + os.path.basename(file_path))
