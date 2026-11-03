@@ -78,6 +78,7 @@ NIGHTLY-RESULT: ok discovered=N transcribed=N batches=N patches=N pending=0 gate
 6. **空批**：`queue` 排到 0 篇也会写台账留一条空批——查「还有没有活」请读 `corpus_status.docsRemaining`，别拿 `corpus_batch` 试。
 7. **转录中途被掐**：若 00:00 之后发现 `dufu-*.md` 只落了一部分，别重跑整套；`bili_transcribe` 是幂等的（已有 ≥3000 字同名稿直接秒回 cached），逐个补即可。
 8. **ffprobe 路径推导**：`ffprobe_duration()` 曾经用整串 `replace("ffmpeg","ffprobe")` 推路径，而本机目录就叫 `ffmpeg`（`~/.dsh/speech-to-text/ffmpeg/`），目录名也被替换成 `ffprobe` → `FileNotFoundError [WinError 2]`。表现为**长稿整单失败**（29 分钟那篇连挂三次），而短稿因为走 FLV 兜底 + API 时长而「看起来正常」。现已修成 `_ffprobe_path()`（只换 basename + 兜底 `shutil.which`）；同类代码不要再对整串做 replace。
+9. **充电专属不记账**：`charging_videos.json` 是「哪些稿子因为没充电权限没拿到」的唯一账本（10-31 那次 173 条里查出 12 条缺稿全靠它）。`discover.py` 的 `add_charging_bvids()` 曾只有定义没有调用者，转写判出 `stage=CHARGING` 的稿子从不入账，视频滑出 7 天窗口后就再无痕迹。现由 `python/bridge.py` 在 `code == "CHARGING"` 分支自动写入并同步镜像（2026-11-03 起）。自查：`charging_videos.json` 的条数应随每日 CHARGING 失败递增。
 
 ## Cookie（充电专属 / 会员视频）
 

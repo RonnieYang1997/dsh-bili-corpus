@@ -190,6 +190,21 @@ def main():
             code = "CHARGING"
         elif "WhisperPayload" in name or "Payload" in name:
             code = "PAYLOAD"
+        if code == "CHARGING":
+            # 记进充电缓存：`charging_videos.json` 是「哪些稿子因为没充电权限没拿到」的
+            # 唯一权威账本（2026-10-31 对账 173 条里 12 条缺稿全靠它）。不记的话，
+            # 视频一旦滑出 7 天发现窗口，就再没有任何地方能看出它被漏掉了。
+            try:
+                _eng = os.path.join(here, "engine")
+                if _eng not in sys.path:
+                    sys.path.insert(0, _eng)
+                import discover as _disc
+                n = _disc.add_charging_bvids([args.bvid])
+                emit({"type": "stage", "stage": "charging-recorded",
+                      "msg": "已记入充电缓存（累计 %d 条）" % n})
+            except Exception as _ce:
+                emit({"type": "stage", "stage": "charging-record-failed",
+                      "msg": str(_ce)[:200]})
         msg = str(e)
         emit({"type": "result", "ok": False, "error": code, "message": msg[:2000]})
         traceback.print_exc()
