@@ -79,6 +79,7 @@ NIGHTLY-RESULT: ok discovered=N transcribed=N batches=N patches=N pending=0 gate
 7. **转录中途被掐**：若 00:00 之后发现 `dufu-*.md` 只落了一部分，别重跑整套；`bili_transcribe` 是幂等的（已有 ≥3000 字同名稿直接秒回 cached），逐个补即可。
 8. **ffprobe 路径推导**：`ffprobe_duration()` 曾经用整串 `replace("ffmpeg","ffprobe")` 推路径，而本机目录就叫 `ffmpeg`（`~/.dsh/speech-to-text/ffmpeg/`），目录名也被替换成 `ffprobe` → `FileNotFoundError [WinError 2]`。表现为**长稿整单失败**（29 分钟那篇连挂三次），而短稿因为走 FLV 兜底 + API 时长而「看起来正常」。现已修成 `_ffprobe_path()`（只换 basename + 兜底 `shutil.which`）；同类代码不要再对整串做 replace。
 9. **充电专属不记账**：`charging_videos.json` 是「哪些稿子因为没充电权限没拿到」的唯一账本（10-31 那次 173 条里查出 12 条缺稿全靠它）。`discover.py` 的 `add_charging_bvids()` 曾只有定义没有调用者，转写判出 `stage=CHARGING` 的稿子从不入账，视频滑出 7 天窗口后就再无痕迹。现由 `python/bridge.py` 在 `code == "CHARGING"` 分支自动写入并同步镜像（2026-11-03 起）。自查：`charging_videos.json` 的条数应随每日 CHARGING 失败递增。
+10. **手动删稿会留死索引**：`bili_transcribe` 归档时会给两处 `MEMORY.md` 各补一行，但**没有「删稿」工具**。手动删掉 `dufu-<bvid>.md`（或 `git clean` 清掉未跟踪文件）后，索引行还在，次日 `corpus_gates` 直接报 `MEMORY.md 索引指向不存在的文件`。处理：把两处 `MEMORY.md` 里对应的 `- dufu-<bvid>` 行删掉（`encoding="utf-8"` 无 BOM），再跑 `corpus_gates` 复核。2026-11-04 23:06 手动转的《植物油如何打败黄油和猪油？…｜有佑 U_NoKnow》就是这么留下的死索引。
 
 ## Cookie（充电专属 / 会员视频）
 
