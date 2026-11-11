@@ -18,35 +18,33 @@ import os, sys, json, hashlib, urllib.parse, urllib.request, urllib.error, ssl, 
 # Configuration
 # ============================================================
 
-_DEFAULT_COOKIE = ""  # 不在仓库里存 cookie：从 BILI_COOKIE 环境变量或 ~/.dsh/bili-cookie.txt 读取
+# 凭据（2026-10-15 整改）：**源码里绝不存放 cookie**。
+# 这里曾在第 21 行硬编码一整条真实账号 cookie（SESSDATA + bili_jct），
+# 等于把账号凭据写进源码随 git 走。现已抽到 bili_credentials.py：
+#   查找顺序 = 显式参数 → 环境变量 → ./cookies.txt → <skill>/cookies.txt
+#              → ~/.config/bilibili-transcribe/cookies.txt（推荐）
+# 空串是**合法状态**：B站公开视频的低清档位无需登录，匿名即可取流。
+# 调用方若拿到 -101/-404/-352，再向用户索取 cookie 并 set_cookie()。
+try:
+    from bili_credentials import (resolve_cookie as _resolve_cookie,
+                                  cookie_hint, validate_cookie)
+except ImportError:  # 直接以脚本方式运行（scripts/ 未在 sys.path 上）
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from bili_credentials import (resolve_cookie as _resolve_cookie,
+                                  cookie_hint, validate_cookie)
+
+COOKIE = _resolve_cookie(quiet=True)
 
 
-COOKIE_FILE = "C:\\Users\\Ronnie/.dsh/bili-cookie.txt"
+def set_cookie(cookie=None, cookie_file=None, quiet=True):
+    """覆盖本次会话使用的 cookie（返回生效值）。空串 = 匿名。"""
+    global COOKIE
+    COOKIE = _resolve_cookie(explicit=cookie, cookie_file=cookie_file, quiet=quiet)
+    return COOKIE
 
-
-def _load_cookie():
-    """Cookie 取法：环境变量 BILI_COOKIE → ~/.dsh/bili-cookie.txt → 下方内置兜底。
-
-    换 cookie 只要覆盖文件（或设环境变量）即可，不用改代码。
-    """
-    v = str(os.environ.get("BILI_COOKIE") or "").strip()
-    if v:
-        return v
-    try:
-        if os.path.isfile("C:\\Users\\Ronnie/.dsh/bili-cookie.txt"):
-            t = open("C:\\Users\\Ronnie/.dsh/bili-cookie.txt", encoding="utf-8-sig").read().strip()
-            if t:
-                return t
-    except Exception:
-        pass
-    return _DEFAULT_COOKIE
-
-
-COOKIE = _load_cookie()
 
 # 2026-10-09：在线 Whisper 的端点与密钥已**全部移除**（连同 multipart 上传代码）。
 # 现役识别引擎 = 本机 SenseVoice，见文件末尾的 "Local ASR" 一节。
-# 顺带的好处：这个文件里不再存放任何第三方 API 凭据。
 
 class ChargingVideoError(Exception):
     """Raised when a video is charging-exclusive and only a preview is available."""
@@ -63,37 +61,78 @@ SSL_CTX.verify_mode = ssl.CERT_NONE
 # FFmpeg path
 # ============================================================
 
-def _find_ffmpeg():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    for candidate in [
-        # 本机已备好的一份（P1 起 ffmpeg/ffprobe 都搬到 DSH 家目录，不再依赖会话目录）
-        os.path.join(os.path.expanduser('~'), '.dsh', 'speech-to-text', 'ffmpeg', 'ffmpeg.exe'),
-        os.path.join(script_dir, '..', '..', '..', '..', 'ffmpeg.exe'),
-        os.path.join(script_dir, '..', 'ffmpeg.exe'),
+def _bili_home():
+    """运行时自备目录：venv / ffmpeg / （可选）模型。
+
+    默认 `~/.dsh/bili-corpus`，`DSH_BILI_HOME`（或 `BILI_HOME`）可覆盖。
+    2026-11-10：引擎从独立技能目录搬进插件后，**不再从任何技能目录借用运行时**——
+    解释器、ffmpeg 都放这里，模型优先用 DSH 的 speech-to-text 目录（兜底）。
+    """
+    env = os.environ.get('DSH_BILI_HOME') or os.environ.get('BILI_HOME')
+    if env:
+        return env
+    return os.path.join(os.path.expanduser('~'), '.dsh', 'bili-corpus')
+
+
+def _ffmpeg_candidates():
+    """候选 ffmpeg 路径（按优先级）。只列，不判断。
+
+    **技能自带优先**（`<技能>/bin/`，由 `fetch_ffmpeg.py` 一次性装好），
+    PATH 与系统安装只作最后兜底。
+
+    2026-10-15：不再去 AionUi/DSH 的会话目录里"借用"别人的 ffmpeg.exe。
+    那是**运行时依赖别人的安装** —— 对方一删、一搬、一换机器就断，
+    而且断得很晚很难查（实测断在"取时长"那步，报 WinError 2，指向还不对）。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    skill = os.path.dirname(here)
+    cands = [
+        os.environ.get('FFMPEG', ''),
+        os.environ.get('SENSEVOICE_FFMPEG', ''),
+        # 运行时自备目录（首选，由 fetch_ffmpeg.py 或手动放置）
+        os.path.join(_bili_home(), 'bin', 'ffmpeg.exe'),
+        os.path.join(_bili_home(), 'ffmpeg.exe'),
+        # 引擎自带
+        os.path.join(skill, 'bin', 'ffmpeg.exe'),
+        os.path.join(skill, 'ffmpeg.exe'),
+        os.path.join(here, 'ffmpeg.exe'),
+        # 当前工作目录
         os.path.join(os.getcwd(), 'ffmpeg.exe'),
-        'ffmpeg',
-    ]:
-        if shutil.which(candidate) or os.path.isfile(candidate):
-            return candidate
+        # 旧布局：脚本往上四层
+        os.path.join(here, '..', '..', '..', '..', 'ffmpeg.exe'),
+        # 系统级安装（用户自己装的才走这里）
+        os.path.join(os.path.expanduser('~'), 'scoop', 'shims', 'ffmpeg.exe'),
+        r'C:\ffmpeg\bin\ffmpeg.exe',
+        shutil.which('ffmpeg') or '',
+    ]
+    return [c for c in cands if c]
+
+
+def _runs(exe):
+    """该可执行文件能否真的跑起来（返回码 0）。不用管道（R22）。"""
+    try:
+        r = subprocess.run([exe, '-version'], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _find_ffmpeg():
+    """找到**能跑**的 ffmpeg。
+
+    2026-10-15 修：原实现只查 4 个位置、也不验证可用性，找不到就退化成裸名
+    `'ffmpeg'`；本机 PATH 上没有 ffmpeg（它躺在 AionUi 会话目录里），
+    于是下载成功后在"取时长"那一步才炸出 WinError 2，报错还指向别处。
+    现在：逐个验证能执行再选定，并覆盖本机已知位置。
+    """
+    for c in _ffmpeg_candidates():
+        if (os.path.isfile(c) or shutil.which(c)) and _runs(c):
+            return c
     return 'ffmpeg'
 
+
 FFMPEG = _find_ffmpeg()
-
-
-def _ffprobe_path():
-    """ffprobe 与 ffmpeg 同目录同基名。
-
-    注意：**只能换基名，不能对整串做 replace**——本机目录就叫 `ffmpeg`
-    （`~/.dsh/speech-to-text/ffmpeg/ffmpeg.exe`），整串替换会把目录也改成
-    `ffprobe`，得到不存在的 `.../ffprobe/ffprobe.exe`，子进程直接
-    `FileNotFoundError [WinError 2]`（2026-11-02 长稿转写失败的根因）。
-    """
-    head, base = os.path.split(FFMPEG)
-    probe = base.replace('ffmpeg', 'ffprobe')
-    cand = os.path.join(head, probe) if head else probe
-    if os.path.isfile(cand) or (not head and shutil.which(cand)):
-        return cand
-    return shutil.which('ffprobe') or cand
 
 
 # R22: never let an ffmpeg/ffprobe child stall a whole batch.
@@ -139,13 +178,53 @@ def run_capture(cmd, timeout=60, tag=""):
         return tf.read().decode("utf-8", errors="replace")
 
 
+def run_capture_stderr(cmd, timeout=60, tag="", ok_rc=(0,)):
+    """Run a command and capture **stderr** without pipes (safe on Windows).
+
+    给 `ffmpeg -i` 这类"信息打在 stderr 上、且故意以非 0 退出"的命令用：
+    `ffmpeg -i <file>` 没给输出文件，所以返回 1，但 Duration 已经打在 stderr 上了。
+    与 run_capture 一样走临时文件而不是管道（Windows 上管道是踩过的坑）。
+    """
+    with tempfile.TemporaryFile() as tf:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=tf)
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            try:
+                p.wait(timeout=20)
+            except Exception:
+                pass
+            raise RuntimeError("command timed out after %ss (%s)" % (timeout, tag))
+        tf.seek(0)
+        out = tf.read().decode("utf-8", errors="replace")
+    if p.returncode not in ok_rc:
+        raise RuntimeError("command rc=%s (%s)" % (p.returncode, tag))
+    return out
+
+
+RE_FFMPEG_DUR = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
+
+
 def ffprobe_duration(file_path, timeout=60):
-    """Duration in seconds via ffprobe (pipe-free)."""
-    probe = _ffprobe_path()
-    out = run_capture([probe, "-v", "error", "-show_entries", "format=duration",
-                       "-of", "default=noprint_wrappers=1:nokey=1", file_path],
-                      timeout=timeout, tag="ffprobe " + os.path.basename(file_path))
-    return float(out.strip())
+    """Duration in seconds —— **只用 ffmpeg**，不再需要 ffprobe.exe。
+
+    2026-10-15：ffprobe.exe 有 161MB，而它在这里只干一件事 —— 报时长。
+    `ffmpeg -i <file>` 本来就把 `Duration: HH:MM:SS.xx` 打在 stderr 上
+    （且因为没给输出文件而返回 1，所以这里容忍 rc=1）。
+    去掉 ffprobe 让技能自带运行时的体积**减半**（323MB → 161MB），
+    下载量也减半，且少一个要维护的二进制。
+
+    函数名保留：调用点有好几处，改名只会扩大改动面。
+    """
+    out = run_capture_stderr(
+        [FFMPEG, "-hide_banner", "-i", file_path], timeout=timeout,
+        tag="ffmpeg -i " + os.path.basename(file_path), ok_rc=(0, 1))
+    m = RE_FFMPEG_DUR.search(out)
+    if not m:
+        raise RuntimeError("ffmpeg 没能报出时长（%s）" % os.path.basename(file_path))
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 # ============================================================
 # Logging
@@ -318,21 +397,16 @@ def download_file(url, output_path, referer='https://www.bilibili.com/'):
     try:
         resp = urllib.request.urlopen(req, timeout=600, context=SSL_CTX)
     except urllib.error.HTTPError as e:
-        # 416 = 断点续传的 Range 越界。最常见的原因不是"文件坏了"，而是
-        # 上一次进程被杀时**音频其实已经下完**，本地文件是完整的，服务端却
-        # 认为 bytes=<size>- 越界。这时不能重试 Range，必须删掉本地文件从 0 重下。
-        if e.code == 416 and existing_size > 0:
-            print(f'  Range 越界（本地已有 {existing_size} 字节，多半是上次下完没记账），删除后整段重下')
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-            headers.pop('Range', None)
-            req = urllib.request.Request(url, headers=headers)
-            resp = urllib.request.urlopen(req, timeout=600, context=SSL_CTX)
-            existing_size = 0
-        else:
+        # 416 = 本地文件已有长度 >= 服务端长度，即上次被杀时其实已经下完。
+        # 旧行为直接抛错，一整讲报废（082/088 实测）；新行为：本地文件可能只是
+        # 长度凑巧相等但内容损坏，所以删掉重下一次，而不是断言它有效。
+        if e.code != 416 or existing_size == 0:
             raise
+        os.remove(output_path)
+        headers.pop('Range', None)
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=600, context=SSL_CTX)
+        existing_size = 0
 
     mode = 'ab' if existing_size > 0 else 'wb'
     with open(output_path, mode) as f:
@@ -371,15 +445,41 @@ def download_flv_extract_audio(bvid, cid, output_dir):
     except Exception:
         return None
 
-def download_audio(bvid, output_dir='_transcribe_temp'):
+def select_page(info, page=1):
+    """从 view 接口的数据里挑出**某一分 P** 的 (cid, 时长, 分P标题, 分P总数)。
+
+    为什么必须挑：多分 P 视频（讲座、课程、连续剧）的 `duration` 是**所有分 P 之和**，
+    而顶层 `cid` 只是第 1 个分 P。直接拿顶层那两个字段配着用，就会得到
+    "时长 23.7 小时、只下到 1.6 小时"的假象 —— 实测把一个 14 讲课程的第 1 讲
+    误判成 ChargingVideoError（充电专属预览）。见 R42。
+    """
+    pages = info.get("pages") or []
+    count = len(pages) or 1
+    try:
+        page = int(page or 1)
+    except (TypeError, ValueError):
+        page = 1
+    if page < 1 or page > count:
+        raise ValueError("分 P 超出范围：page=%s，共 %d 个分 P" % (page, count))
+    if pages:
+        pg = pages[page - 1]
+        return (pg.get("cid") or info.get("cid"),
+                pg.get("duration") or info.get("duration", 0),
+                pg.get("part") or "",
+                count)
+    return info.get("cid"), info.get("duration", 0), "", 1
+
+
+def download_audio(bvid, output_dir='_transcribe_temp', page=1):
     """Download DASH M4A audio for a video. Returns (m4a_path, info_dict).
+
+    `page` 是**从 1 开始**的分 P 序号（多分 P 视频必需，见 select_page）。
     Raises ChargingVideoError if the downloaded file is a truncated charging preview."""
     os.makedirs(output_dir, exist_ok=True)
 
     info = get_video_info(bvid)
-    cid = info['cid']
+    cid, duration, part, page_count = select_page(info, page)
     title = info['title']
-    duration = info.get('duration', 0)
     # frontmatter "date" must be the video's PUBLISH date, never the day the
     # transcription happened to run.  Falling back to today's date silently
     # writes wrong metadata on any back-fill / batch run.
@@ -399,19 +499,24 @@ def download_audio(bvid, output_dir='_transcribe_temp'):
 
     try:
         audio_url, dur_from_api = get_audio_url(bvid, cid)
-        m4a_path = os.path.join(output_dir, f'{bvid}.m4a')
+        # 多分 P 的文件名必须带页码，否则转第 2 个分 P 会覆盖第 1 个
+        _name = f'{bvid}.m4a' if page_count == 1 else f'{bvid}-p{int(page):02d}.m4a'
+        m4a_path = os.path.join(output_dir, _name)
         download_file(audio_url, m4a_path, referer=f'https://www.bilibili.com/video/{bvid}')
         if not duration:
             duration = dur_from_api
-        
-        # Check if the downloaded file is a charging preview (truncated)
+
+        # Check if the downloaded file is a charging preview (truncated).
+        # 这里比的是**本分 P 的时长**，不是整条视频的总时长（R42）。
         actual_dur = get_audio_duration(m4a_path)
         if duration > 0 and actual_dur < duration * 0.2:
             raise ChargingVideoError(
                 f"Charging video detected: API reports {duration}s but downloaded only {actual_dur:.0f}s"
             )
-        
-        return m4a_path, {'title': title, 'duration_sec': duration, 'bvid': bvid, 'date': date_str}
+
+        return m4a_path, {'title': title, 'duration_sec': duration, 'bvid': bvid,
+                          'date': date_str, 'page': int(page),
+                          'page_count': page_count, 'part': part}
     except ChargingVideoError:
         raise
     except Exception as e:
@@ -432,7 +537,9 @@ def download_audio(bvid, output_dir='_transcribe_temp'):
                 real_dur = int(round(float(real_dur)))
             except (TypeError, ValueError):
                 real_dur = int(duration or 0)
-            return m4a_path, {'title': title, 'duration_sec': real_dur, 'bvid': bvid, 'date': date_str}
+            return m4a_path, {'title': title, 'duration_sec': real_dur, 'bvid': bvid,
+                              'date': date_str, 'page': int(page),
+                              'page_count': page_count, 'part': part}
         raise e
 
 # ============================================================
@@ -440,7 +547,7 @@ def download_audio(bvid, output_dir='_transcribe_temp'):
 # ============================================================
 
 def get_audio_duration(file_path):
-    """Get audio duration in seconds using ffprobe."""
+    """Get audio duration in seconds（走 ffmpeg，不再需要 ffprobe，见上）。"""
     return ffprobe_duration(file_path)
 
 def split_audio(m4a_path, max_seconds=1200):
@@ -542,6 +649,7 @@ def looks_like_api_error(text):
 
 
 def _skill_dir():
+    """引擎自带资源目录（插件内 = `python/engine`）。"""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -549,17 +657,66 @@ def _sensevoice_cli():
     return os.path.join(_skill_dir(), 'scripts', 'sensevoice_asr.py')
 
 
-def _sensevoice_python():
-    """承载 sherpa-onnx 的解释器（技能自己的 venv）。
+_ASR_PY_CACHE = None
 
-    采集器本身跑在 python-embedded（没有 pip），所以识别必须由这个 venv 承担；
-    这里只做"找到它"，找不到就明确报错，绝不静默退化成别的东西。
+
+def _asr_candidates():
+    """候选 ASR 解释器，按优先级排列（只列路径，不判断可用性）。
+
+    **只认技能自己的 venv**（`<技能>/.venv`，由 `setup.sh` 建）。
+
+    2026-10-15：删掉了"复用 AionUi 会话目录里那份技能的 venv"的逻辑。
+    那是**运行时依赖别人的安装**：看着省事（零安装），实则把技能绑死在
+    另一个应用的私有目录上 —— 那个应用一卸载、一升级、换台机器，
+    技能就"找不到解释器"，而报错完全指不出真正的原因。
+    技能要能独立存活：自己的 venv、自己的模型、自己的 ffmpeg。
     """
-    for c in (os.environ.get('SENSEVOICE_PYTHON', ''),
-              os.path.join(_skill_dir(), '.venv', 'Scripts', 'python.exe'),
-              os.path.join(_skill_dir(), '.venv', 'bin', 'python')):
-        if c and os.path.isfile(c):
+    here = _skill_dir()
+    home = _bili_home()
+    cands = [
+        os.environ.get('SENSEVOICE_PYTHON', ''),
+        # 运行时自备（首选）：~/.dsh/bili-corpus/.venv
+        os.path.join(home, '.venv', 'Scripts', 'python.exe'),
+        os.path.join(home, '.venv', 'bin', 'python'),
+        os.path.join(here, '.venv', 'Scripts', 'python.exe'),
+        os.path.join(here, '.venv', 'bin', 'python'),
+        # SKILL.md 早期写的是 scripts/.venv —— 两种位置都认，免得文档与代码打架
+        os.path.join(here, 'scripts', '.venv', 'Scripts', 'python.exe'),
+        os.path.join(here, 'scripts', '.venv', 'bin', 'python'),
+    ]
+    return [c for c in cands if c]
+
+
+def _has_sherpa(py):
+    """该解释器能否 import sherpa_onnx。
+
+    不用管道（R22）：Windows 上管道收尾会卡死，改用 DEVNULL + 硬超时。
+    """
+    try:
+        r = subprocess.run([py, '-c', 'import sherpa_onnx'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=90)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _sensevoice_python():
+    """承载 sherpa-onnx 的解释器。
+
+    采集器本身跑在 python-embedded（没有 pip），所以识别必须由别的解释器承担。
+    这里**逐个验证能 import sherpa_onnx**再选定（结果缓存），而不是"路径存在就用"——
+    否则一个空壳 venv 会让识别在很后面才失败，报错还指向别处。
+    找不到就明确报错，绝不静默退化成别的东西。
+    """
+    global _ASR_PY_CACHE
+    if _ASR_PY_CACHE is not None:
+        return _ASR_PY_CACHE
+    for c in _asr_candidates():
+        if os.path.isfile(c) and _has_sherpa(c):
+            _ASR_PY_CACHE = c
             return c
+    _ASR_PY_CACHE = ''
     return ''
 
 
@@ -576,19 +733,27 @@ def _plugin_models():
 
 
 def _sensevoice_model_dir():
-    """模型查找顺序：环境变量 → DSH 插件（用户已备好）→ 技能自带兜底。"""
+    """模型查找顺序：环境变量 → **技能自带** → DSH 插件目录（兜底）。
+
+    2026-10-15：把技能自带提到前面。技能要能独立存活，不能默认指望
+    `~/.dsh` 下那份插件模型一直在（它属于 DSH 的另一个插件，不是本技能的资产）。
+    """
     return _first_existing([
         os.environ.get('SENSEVOICE_MODEL_DIR', ''),
-        os.path.join(_plugin_models(), 'sensevoice-onnx'),
+        os.path.join(_bili_home(), 'models', 'sensevoice-small'),
+        os.path.join(_bili_home(), 'models', 'sensevoice-onnx'),
         os.path.join(_skill_dir(), 'models', 'sensevoice-small'),
+        os.path.join(_skill_dir(), 'models', 'sensevoice-onnx'),
+        os.path.join(_plugin_models(), 'sensevoice-onnx'),
     ])
 
 
 def _sensevoice_vad_model():
     return _first_existing([
         os.environ.get('SENSEVOICE_VAD_MODEL', ''),
-        os.path.join(_plugin_models(), 'silero', 'silero_vad.onnx'),
+        os.path.join(_bili_home(), 'models', 'silero', 'silero_vad.onnx'),
         os.path.join(_skill_dir(), 'models', 'silero', 'silero_vad.onnx'),
+        os.path.join(_plugin_models(), 'silero', 'silero_vad.onnx'),
     ])
 
 
@@ -624,6 +789,11 @@ def _run_sensevoice(files, language='zh', timeout=None, tag=''):
 
     cmd = [py, cli] + list(files) + ['--language', language, '--quiet',
                                      '--model-dir', model_dir]
+    # 把本模块**已验证可运行**的 ffmpeg 显式传给子进程。两边各有一套查找逻辑，
+    # 不传的话子进程会自己再找一次并可能失败（2026-10-15 实测：
+    # 父进程已解析到可用 ffmpeg，子进程却报 "找不到 ffmpeg: ffmpeg"）。
+    if FFMPEG and (os.path.isfile(FFMPEG) or shutil.which(FFMPEG)):
+        cmd += ['--ffmpeg', FFMPEG]
     vad = _sensevoice_vad_model()
     if vad:
         cmd += ['--vad-model', vad]
@@ -678,7 +848,38 @@ def transcribe_long_audio(m4a_path, language='zh', model=None):
 # Transcript Saving
 # ============================================================
 
-def save_transcript(bvid, text, video_info=None, output_dir=None, name=None):
+def transcript_path(output_dir, bvid, name_template=None, page=None):
+    """按命名模板算出稿件路径。默认 `{bvid}.md`（通用）；
+    独夫之心语料用 `--name-template 'dufu-{bvid}.md'`。
+
+    多分 P 视频（讲座/课程）必须给 `page`，否则 14 讲会全写进同一个文件。
+    模板里可显式写 `{p}`（展开成 `p01`）；没写就自动在扩展名前补 `-p01`。
+    """
+    tpl = name_template or os.environ.get("BILI_NAME_TEMPLATE") or "{bvid}.md"
+    fields = {"bvid": bvid}
+    if page is not None:
+        fields["p"] = "p%02d" % int(page)
+        fields["page"] = int(page)
+        if "{p}" not in tpl and "{page}" not in tpl:
+            base, ext = os.path.splitext(tpl)
+            tpl = base + "-{p}" + ext
+    elif "{p}" in tpl or "{page}" in tpl:
+        raise ValueError("命名模板里有 {p}/{page}，但没有指定分 P（--p）")
+    return os.path.join(output_dir, tpl.format(**fields))
+
+
+def _page_for_name(video_info):
+    """只有**多分 P** 视频才在文件名里带页码，单分 P 保持 `{bvid}.md` 不变。
+
+    这样既有语料（独夫之心 3760 篇）的命名一个都不动，而课程类视频不会互相覆盖。
+    """
+    info = video_info or {}
+    if (info.get('page_count') or 1) > 1:
+        return info.get('page') or 1
+    return None
+
+
+def save_transcript(bvid, text, video_info=None, output_dir=None, name_template=None):
     """Save transcript as a memory file. Returns file path."""
     # R21: the last line of defence - an error payload must never become a transcript
     # file (14 such files had to be cleaned out of the corpus by hand).
@@ -691,9 +892,12 @@ def save_transcript(bvid, text, video_info=None, output_dir=None, name=None):
     if video_info is None:
         video_info = {}
     title = video_info.get('title', bvid)
-    # Prefer the real publish date; only fall back to today when it is genuinely
-    # unknown (e.g. the caller passed a hand-built info dict).
-    date_str = video_info.get('date') or time.strftime('%Y-%m-%d')
+    # R6/R14：`date` 只信 API 的 pubdate。取不到就**留空并告警**，绝不静默填今天。
+    # 2026-10-15 修：原实现是 `... or time.strftime('%Y-%m-%d')`，批量回填/补录时
+    # 会把"运行日"当成"发布日"写进历史 —— 正是 R6 记载的那类事故。
+    date_str = (video_info.get('date') or '').strip()
+    if not date_str:
+        sys.stderr.write("[warn] %s 取不到 pubdate，date 留空（R6/R14：不得填今天）\n" % bvid)
     duration = video_info.get('duration_sec', 0)
 
     # R19: a 连麦/问答 video interleaves other people's opinions with the author's,
@@ -707,6 +911,12 @@ def save_transcript(bvid, text, video_info=None, output_dir=None, name=None):
         # unquoted, matching the existing corpus convention (`type: dialogue`)
         extra = ('type: dialogue\n'
                  'warning: "%s"\n' % QA_WARNING)
+    # R42：多分 P 视频的 `title` 是**整条视频**的标题，14 讲全都一样，
+    # 光看 frontmatter 分不出这是第几讲。所以多分 P 时补 `part`（B站给的分P名，
+    # 课程类通常就是 "1" "2" …）。单分 P 不写，既有语料一个字不动。
+    if (video_info.get('page_count') or 1) > 1:
+        _part = str(video_info.get('part') or video_info.get('page') or '').strip()
+        extra += 'part: "%s"\n' % _part.replace('"', "'")
 
     yaml_header = f"""---
 title: "{title}"
@@ -717,11 +927,18 @@ source: "bilibili"
 {extra}---
 
 """
-    # P3：文件名可由调用方指定（标题式命名）；默认仍是 dufu-<bvid>.md
-    filepath = os.path.join(output_dir, name or f'dufu-{bvid}.md')
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(yaml_header)
-        f.write(text)
+    filepath = transcript_path(output_dir, bvid, name_template,
+                               page=_page_for_name(video_info))
+    # R26：新建文件跟随多数派 CRLF，且**不混行**。原实现靠 Windows 的
+    # 通用换行翻译隐式产生 CRLF，在非 Windows 上会变成 LF（同一技能两种产物）；
+    # 这里显式归一，结果与平台无关。
+    newline = os.environ.get("BILI_NEWLINE", "crlf").lower()
+    body = yaml_header + text
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    if newline != "lf":
+        body = body.replace("\n", "\r\n")
+    with open(filepath, 'w', encoding='utf-8', newline='') as f:
+        f.write(body)
 
     return filepath
 
@@ -729,8 +946,14 @@ source: "bilibili"
 # Full Pipeline
 # ============================================================
 
-def process_video(bvid, output_dir=None, temp_dir=None, name=None):
-    """Full pipeline: download audio → transcribe → save transcript."""
+def process_video(bvid, output_dir=None, temp_dir=None, name_template=None,
+                  keep_audio=False, min_chars=3000, page=None):
+    """Full pipeline: download audio → transcribe → save transcript.
+
+    keep_audio=True 时**不删**临时音频（拆"先下载、后识别"两班跑时必需：
+    默认行为的 finally 会把音频删掉，第二班就无料可识别）。
+    `page` 是 1 起的分 P 序号（多分 P 课程必需）；None = 第 1 个分 P 且不加页码后缀。
+    """
     if temp_dir is None:
         temp_dir = os.path.join(os.getcwd(), '_transcribe_temp')
     os.makedirs(temp_dir, exist_ok=True)
@@ -738,8 +961,24 @@ def process_video(bvid, output_dir=None, temp_dir=None, name=None):
     if output_dir is None:
         output_dir = os.path.join(os.getcwd(), 'memory')
 
+    _pg = 1 if page is None else int(page)
+    # 缓存判定的路径要先知道"这是不是多分 P"，所以先探一次 info（一次 view 请求）
+    _probe = None
+    try:
+        _probe = get_video_info(bvid)
+        _pcount = len((_probe.get('pages') or [])) or 1
+        _cid_check, _dur_check, _part_check, _pcount = select_page(_probe, _pg)
+    except Exception:
+        _pcount = 1
+        _dur_check = 0
+        _part_check = ''
+
+    def _path_for(pnum):
+        return transcript_path(output_dir, bvid, name_template,
+                               page=pnum if _pcount > 1 else None)
+
     # Check if already transcribed (skip short/truncated files)
-    existing = os.path.join(output_dir, name or f'dufu-{bvid}.md')
+    existing = _path_for(_pg)
     if os.path.exists(existing):
         with open(existing, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -749,50 +988,68 @@ def process_video(bvid, output_dir=None, temp_dir=None, name=None):
         # 改用同时容纳 CRLF/LF 的正则切出正文。
         _m = re.match(r'^---\r?\n.*?\r?\n---\r?\n', content, re.S)
         text_stripped = (content[_m.end():] if _m else content).strip()
-        # If transcript is <3000 chars for a known long video, re-transcribe
-        # (500 chars = ~1 minute of speech, clearly truncated)
-        if len(text_stripped) >= 3000:
+        # 短视频（片头/通知/广告）正文天然只有几个字，不能拿 3000 字去卡，
+        # 否则每次重跑都会白重转一遍（2026-10-15 实测：16 秒的片头每次都重转）。
+        _dm = re.search(r'^duration:\s*(\d+)', content, re.M)
+        _dur = int(_dm.group(1)) if _dm else 0
+        cached_ok = len(text_stripped) >= min_chars or (text_stripped and _dur <= 120)
+        if cached_ok:
             return {
                 'bvid': bvid,
                 'path': existing,
-                'duration': 0,
+                'duration': _dur,
                 'text_length': len(text_stripped),
-                'cached': True
+                'cached': True,
+                'page': _pg if _pcount > 1 else None,
             }
 
     try:
-        m4a_path, info = download_audio(bvid, temp_dir)
+        m4a_path, info = download_audio(bvid, temp_dir, page=_pg)
         text = transcribe_long_audio(m4a_path)
-        filepath = save_transcript(bvid, text, info, output_dir, name=name)
+        filepath = save_transcript(bvid, text, info, output_dir, name_template)
 
         return {
             'bvid': bvid,
             'path': filepath,
             'duration': info.get('duration_sec', 0),
             'text_length': len(text),
-            'cached': False
+            'cached': False,
+            'page': info.get('page') if (info.get('page_count') or 1) > 1 else None,
+            'part': info.get('part') or '',
         }
     except ChargingVideoError:
         raise
     finally:
-        # Cleanup temp files
-        try:
-            for f in os.listdir(temp_dir):
-                if f.startswith(bvid):
-                    os.remove(os.path.join(temp_dir, f))
-        except Exception:
-            pass
+        # Cleanup temp files（keep_audio=True 时保留，供第二班识别）
+        if not keep_audio:
+            try:
+                for f in os.listdir(temp_dir):
+                    if f.startswith(bvid):
+                        os.remove(os.path.join(temp_dir, f))
+            except Exception:
+                pass
 
 # ============================================================
 # Main entry point
 # ============================================================
 
 if __name__ == '__main__':
+    # 本模块只提供函数。**面向用户的统一入口是 transcribe.py**（下载→本地识别→
+    # 落盘→校验一条龙，只问"转哪些视频""存哪里"）。这里保留旧式单篇调用做兜底。
+    if len(sys.argv) >= 2 and sys.argv[1] in ('-h', '--help'):
+        print(__doc__)
+        print("用法（单篇兜底）：python bilibili_transcribe.py <bvid> [输出目录]")
+        print("推荐入口：python transcribe.py --help")
+        sys.exit(0)
+
     if len(sys.argv) < 2:
-        print("Usage: python bilibili_transcribe.py <bvid>")
+        print("用法（单篇兜底）：python bilibili_transcribe.py <bvid> [输出目录]")
+        print("推荐入口：python transcribe.py   ← 只问「转哪些视频」「存哪里」")
         sys.exit(1)
 
-    bvid = sys.argv[1]
-    result = process_video(bvid)
-    print(f"Done: {result['bvid']} → {result['path']}")
-    print(f"  Duration: {result['duration']}s, Text: {result['text_length']} chars")
+    _bvid = sys.argv[1]
+    _out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.getcwd(), 'memory')
+    result = process_video(_bvid, output_dir=_out)
+    print("Done: %s -> %s" % (result['bvid'], result['path']))
+    print("  Duration: %ss, Text: %s chars, cached=%s"
+          % (result['duration'], result['text_length'], result['cached']))

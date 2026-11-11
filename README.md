@@ -133,17 +133,31 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 `python/bridge.py` 默认用**内置引擎**，不再依赖 AionUi 会话里的技能目录（那个目录随时会被清）。
 解析顺序：`DSH_BILI_ENGINE_DIR`（显式）→ 内置 → 外部技能目录（`--skill-dir` / `DSH_BILI_SKILL_DIR`）。
 
-仍然需要的外部资产（都是模型/二进制，不进 git）：
+仍然是**自备的运行时资产**（模型/二进制/解释器，都不进 git）。2026-11-10 起统一放在
+运行时目录 `DSH_BILI_HOME`（默认 `~/.dsh/bili-corpus`）：
 
 | 资产 | 默认位置 | 说明 |
 | --- | --- | --- |
-| Python venv | `~/.dsh/speech-to-text/venv` | 需含 `sherpa_onnx`、`numpy`；缺失时回退外部技能 venv |
-| SenseVoice 模型 | `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx` | `model.int8.onnx` + `tokens.txt` |
+| Python venv | `~/.dsh/bili-corpus/.venv` | 需含 `sherpa_onnx`、`numpy`（`bash scripts/setup.sh` 可自检/补建） |
+| ffmpeg | `~/.dsh/bili-corpus/bin/ffmpeg.exe` | 引擎用 `ffmpeg -i` 取时长，**不再需要 ffprobe** |
+| SenseVoice 模型 | `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx` | `model.int8.onnx` + `tokens.txt`（引擎也会找 `$DSH_BILI_HOME/models/`） |
 | VAD 模型 | `~/.dsh/speech-to-text/sensevoice/models/silero/silero_vad.onnx` | 缺了会分段质量变差 |
-| ffmpeg / ffprobe | `~/.dsh/speech-to-text/ffmpeg/` | 缺 ffprobe 会被 bridge 直接拦下（防静默 300s 预览） |
 
-迁移到另一台机器：插件自带引擎脚本；把上述四样资产按 `DSH_BILI_*` 指过去即可。
+自检（只读，缺什么报什么）：
+
+```bash
+bash scripts/setup.sh --check      # 4 项：解释器 / 模型+VAD / ffmpeg / 结论
+bash scripts/setup.sh              # 缺的解释器与 ffmpeg 会尝试补
+```
+
+迁移到另一台机器：插件自带引擎脚本 + `docs/` 里的方法论；把运行时目录备好（或设
+`DSH_BILI_HOME` 指过去），模型按 `DSH_BILI_MODEL_DIR` / `SENSEVOICE_MODEL_DIR` 指过去即可。
 `bili_jobs` 返回的 `skill.kind` 会显示当前用的是 `builtin` 还是 `external`。
+
+> 2026-11-10：原独立技能目录 `Documents/GitHub/Skills/bilibili-transcribe` 已整体并入本插件
+> （引擎脚本、`calibrate.py`/`merge_rules.py`/`validate_transcript.py`、`SKILL.md` 方法论
+> → `docs/skill-reference.md`、`docs/references/*.md`、`scripts/setup.sh`），并已删除对该目录的
+> 所有硬编码依赖；该目录可以安全删除。
 
 ## 第二个语料 / 多语料（实验）
 
@@ -285,11 +299,23 @@ python mine_rules.py --src <逐讲表目录> --corpus <id> --min-lectures 3   # 
 2. **不许自食**（键含于值）：`黑格 → 黑格尔` 每遍都会再长一个"尔"，永不收敛。`check` / `apply` 会直接拦下，`--force` 才放行。解药是前移真实左邻字（`。黑格`），**不是**加空转守卫。
 3. **不许重复键**：同一键出现两次说明两张表在打架。跨讲累积表一起喂时加 `merge`（先到先得），否则报错。
 4. **跑到不动点**：单遍替换后还有新命中就再来一遍，上限 8 遍；跑满 8 遍还在变 = 表坏了，直接返回 rc=3。
+5. **零命中分两种病，不能混为一谈**：`check` / `verify` 现在会把它们分开报——
+   - **被长键遮蔽**：键逐字在正文里，但**起点更早、终点更晚**的另一条长键先把它吃了。交替正则是「最左优先、同起点取最长」，左边界更早的键天然压住右边一切。实例：`手口。所以医化这个概念` 被 `经取哲学手口→经济学哲学手稿` 吃掉；`第一条，就对对对象现实` 被 `关于范把它提纲第一条→关于费尔巴哈的提纲第一条` 吃掉。解药是**把键挪到遮蔽段的右边**（`。所以医化这个概念`），不是加守卫、也不是改标点。
+   - **正文里不存在**：键抄错了，或讲者根本没这么说过（跨讲底表在本语料用不上也落这一类）。
+   判据用的是「实际命中次数」而不是「键是否出现在文本里」——两者会分叉，027 讲就是这么漏过去的。
+
+数学校订时另有一条硬规矩：**数字位一律不动**（`三0令`、`1五限令`、`966` 这种宁可留着，也不猜），单位同音字可以改（磅/镑 只在货币语境改，重量语境保留「磅」；先令、便士同理）。
 
 `apply` 默认只试跑，并且会打印**改前上下文**（键在 `【】` 里 + 前后各 14 字）——先看句子，
 再决定要不要落地。落地前把原文件备份到 `<STATE>/_dict_backup/<时间戳>/`，改完可以逐字节回滚。
 
 和 LLM 通道的分工：**词典通道先跑**（0 token、可复算），剩下的新走音才交给 `corpus_batch`。
+
+改 `dict_apply.py` 之前先跑它的自检（13 条断言，全部来自真实事故）：
+
+```bash
+python python/pipeline/dict_apply.py --selftest
+```
 
 ## 已知坑（都是踩过的）
 

@@ -161,9 +161,56 @@ def apply_text(text, rules, rx=None):
 
 
 def zero_hit(rules, texts):
-    """从没在任何一篇里命中过的键（我那条硬判据）。"""
+    """一次都没**命中**过的键（我那条硬判据）。
+
+    注意这里判的是「命中」而不是「键是否出现在正文里」：两者会分叉。
+    键逐字在正文里、却被起点更早的长键先吃掉时，它一次都改不到东西，
+    按「出现在正文」判会认为它没问题——027 讲就是这么漏过去的。
+    所以真跑一遍 apply_text，用命中计数判。
+    """
+    rx = _build_re(rules)
+    fired = {}
+    for t in texts:
+        _, _, _, counts = apply_text(t, rules, rx)
+        for k, n in counts.items():
+            fired[k] = fired.get(k, 0) + n
+    return [k for k, _, _ in rules if not fired.get(k)]
+
+
+def diagnose_miss(rules, texts, misses):
+    """零命中的两种病要分开说，否则永远查不到病根。
+
+    ① absent：键在这份语料里根本不存在——键抄错了，或讲者没这么说过。
+    ② covered：键逐字在正文里，却被**起点更早、终点更晚**的另一条长键先吃掉，
+       所以自己一次都没机会命中。交替正则是「最左优先、同起点取最长」，
+       左边界更早的长键天然压住右边一切。
+
+    实例（027 讲）：`手口。所以医化这个概念` 被 `经取哲学手口→经济学哲学手稿` 吃掉；
+    `第一条，就对对对象现实` 被 `关于范把它提纲第一条→关于费尔巴哈的提纲第一条` 吃掉。
+    解药不是加守卫，是把键挪到遮蔽段的右边（如 `。所以医化这个概念`）。
+    """
     joined = "\n".join(texts)
-    return [k for k, _, _ in rules if k not in joined]
+    rx = _build_re(rules) if rules else None
+    if rx is None:
+        return {}, []
+    longest = max(len(k) for k, _, _ in rules) if rules else 0
+    absent, covered = [], {}
+    for k in misses:
+        pos = joined.find(k)
+        if pos < 0:
+            absent.append(k)
+            continue
+        lo = max(0, pos - longest + 1)
+        cover = None
+        for m in rx.finditer(joined, lo, pos + len(k)):
+            if m.start() < pos and m.end() > pos and m.group(0) != k:
+                cover = m.group(0)
+                break
+        if cover:
+            covered.setdefault(cover, []).append(k)
+        else:
+            absent.append(k)
+    return covered, absent
 
 
 # ---------------------------------------------------------------- 语料
@@ -213,8 +260,18 @@ def cmd_check(a):
             pass
     miss = zero_hit(rules, texts)
     print("全库零命中 %d 条%s" % (len(miss), "" if not miss else "："))
-    for k in miss[:30]:
-        print("   %r" % k)
+    covered, absent = diagnose_miss(rules, texts, miss) if miss else ({}, [])
+    if covered:
+        print("   ── 被长键遮蔽 %d 条（键在正文里，但左边界更早的长键先吃掉了它；"
+              "把键挪到遮蔽段右边即可）：" % sum(len(v) for v in covered.values()))
+        for cover, keys in list(covered.items())[:10]:
+            print("   遮蔽键 %r 吃掉：" % cover)
+            for k in keys[:6]:
+                print("      %r" % k)
+    if absent:
+        print("   ── 正文里根本不存在 %d 条（键抄错了，或讲者没这么说过）：" % len(absent))
+        for k in absent[:20]:
+            print("      %r" % k)
     if miss and not a.strict_miss:
         print("（零命中只作提示：跨讲累积的底表必然有大半在本语料用不上；"
               "要当硬判据请加 --strict-miss）")
@@ -242,9 +299,17 @@ def cmd_verify(a):
     for name, n in sorted(per_doc, key=lambda x: -x[1])[:a.sample]:
         print("   %5d  %s" % (n, name))
     if miss:
-        print("零命中（大概率键抄错了，或已被更长的键吃掉）：")
-        for k in miss[:40]:
-            print("   %r" % k)
+        covered, absent = diagnose_miss(rules, texts, miss)
+        if covered:
+            print("零命中·被长键遮蔽 %d 条（键在正文里，被左边界更早的长键吃了）："
+                  % sum(len(v) for v in covered.values()))
+            for cover, keys in list(covered.items())[:10]:
+                print("   遮蔽键 %r 吃掉 %d 条：%s"
+                      % (cover, len(keys), "、".join(repr(k) for k in keys[:5])))
+        if absent:
+            print("零命中·正文里不存在 %d 条（键抄错或讲者没说过）：" % len(absent))
+            for k in absent[:40]:
+                print("   %r" % k)
     return 0
 
 
@@ -342,7 +407,90 @@ def split_rules(s):
     return out
 
 
+def _selftest():
+    """把一个月的踩坑经验钉成断言，改代码时先跑这个。"""
+    import tempfile
+    ok = fail = 0
+
+    def check(name, got, want):
+        nonlocal ok, fail
+        if got == want:
+            ok += 1
+            print("  PASS %s" % name)
+        else:
+            fail += 1
+            print("  FAIL %s：got %r want %r" % (name, got, want))
+
+    def rules_of(pairs):
+        rs = [(k, v, "selftest") for k, v in pairs]
+        rs.sort(key=lambda r: -len(r[0]))  # 与 load_rules 同序
+        return rs
+
+    print("[1] 长键优先：同一起点先吃长的")
+    rs = rules_of([("甲甲", "短"), ("甲甲甲", "长")])
+    out, _, _, _ = apply_text("甲甲甲", rs)
+    check("长键胜出（短键先到会变成「短甲」）", out, "长")
+
+    print("[2] 自食（键含于值）必须被点名")
+    check("自食 1 条", len(_self_eating(rules_of([("黑格", "黑格尔")]))), 1)
+    # 注意：单纯前移左邻字不一定解毒——`。黑格` 仍然含在 `。黑格尔` 里。
+    # 真正解毒的是让键**不再出现在值里**（改字形或加右邻字）。
+    check("前移左邻仍自食（键⊂值）",
+          len(_self_eating(rules_of([("。黑格", "。黑格尔")]))), 1)
+    check("换成不含于值的键才解毒",
+          len(_self_eating(rules_of([("黑格法", "黑格尔法")]))), 0)
+
+    print("[3] 跑到不动点：键里含另一条的产出，第二遍才命中")
+    rs = rules_of([("曾森", "曾参"), ("曾参和有弱", "曾参和有若")])
+    out, _, passes, _ = apply_text("曾森和有弱", rs)
+    check("两遍收敛", (out, passes), ("曾参和有若", 2))
+
+    print("[4] 零命中按「命中次数」判，不按「键是否出现在正文里」判")
+    rs = rules_of([("经取哲学手口", "经济学哲学手稿"),
+                   ("手口。所以医化这个概念", "手稿。所以异化这个概念")])
+    text = "1844年经取哲学手口。所以医化这个概念它是来自黑格尔"
+    miss = zero_hit(rs, [text])
+    check("遮蔽键被判零命中", miss, ["手口。所以医化这个概念"])
+
+    print("[5] 零命中分两类：遮蔽 vs 正文里没有")
+    covered, absent = diagnose_miss(rs, [text], miss)
+    check("归为被遮蔽", covered, {"经取哲学手口": ["手口。所以医化这个概念"]})
+    check("无 absent", absent, [])
+    covered2, absent2 = diagnose_miss(rs, [text], ["根本没这串"])
+    check("归为 absent", (covered2, absent2), ({}, ["根本没这串"]))
+    rs3 = rules_of([("经取哲学手口", "经济学哲学手稿"),
+                    ("。所以医化这个概念", "。所以异化这个概念")])
+    check("挪到遮蔽段右边后能命中", zero_hit(rs3, [text]), [])
+
+    print("[6] 重复键默认报错，--merge 才先到先得")
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "dup.tsv")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("甲\t乙\tx\n甲\t丙\ty\n")
+    try:
+        load_rules([p])
+        check("重复键应报错", "没报", "报错")
+    except SystemExit:
+        check("重复键报错", "报错", "报错")
+    check("merge 后保留先到的", load_rules([p], merge=True)[0][1], "乙")
+    shutil.rmtree(d, ignore_errors=True)
+
+    print("[7] --min-key 滤短键（短键跨讲最会误伤）")
+    rs = load_rules([p], merge=True, min_key=2) if False else None
+    d2 = tempfile.mkdtemp()
+    q = os.path.join(d2, "k.tsv")
+    with open(q, "w", encoding="utf-8") as f:
+        f.write("磅\t镑\tx\n二0码\t20码\ty\n")
+    check("min_key=2 只剩长键", [r[0] for r in load_rules([q], min_key=2)], ["二0码"])
+    shutil.rmtree(d2, ignore_errors=True)
+
+    print("\n%d PASS / %d FAIL" % (ok, fail))
+    return 0 if fail == 0 else 1
+
+
 def main():
+    if "--selftest" in sys.argv:
+        return _selftest()
     ap = argparse.ArgumentParser(description="确定性词典通道")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in (("check", cmd_check), ("verify", cmd_verify), ("apply", cmd_apply)):
