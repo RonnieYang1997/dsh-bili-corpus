@@ -78,18 +78,25 @@ type CorpusProfile = {
   pythonAsr: string
 }
 
-/** 引擎路径（Python / 技能脚本）与语料数据路径无关，全局一份；全部按 HOME 推导，不写死用户名。 */
-const SKILLS_VENV = join(HOME, 'Documents', 'GitHub', 'Skills', 'bilibili-transcribe', '.venv', 'Scripts', 'python.exe')
+/**
+ * 引擎路径（Python / 脚本）与语料数据路径无关，全局一份；全部按 HOME 推导，不写死用户名。
+ *
+ * 2026-11-10：插件自带引擎（`python/engine/scripts`），运行时（venv / ffmpeg）自备在
+ * `~/.dsh/bili-corpus`（`DSH_BILI_HOME` 可覆盖）。**不再依赖任何外部技能目录**——
+ * 原来指向 `Documents/GitHub/Skills/bilibili-transcribe/.venv` 的那条已删除。
+ */
+const BILI_HOME = E.DSH_BILI_HOME || join(HOME, '.dsh', 'bili-corpus')
+const BILI_VENV = join(BILI_HOME, '.venv', 'Scripts', 'python.exe')
 const ENGINE = {
   python: E.DSH_CORPUS_PY || firstExisting([
+    BILI_VENV,
     join(HOME, '.dsh', 'speech-to-text', 'venv', 'Scripts', 'python.exe'),
-    SKILLS_VENV,
     join(HOME, 'AppData', 'Local', 'Programs', 'Python', 'Python312', 'python.exe'),
   ]) || 'python',
   pythonAsr: E.DSH_CORPUS_ASR_PY || firstExisting([
+    BILI_VENV,
     join(HOME, '.dsh', 'speech-to-text', 'venv', 'Scripts', 'python.exe'),
-    SKILLS_VENV,
-  ]) || SKILLS_VENV,
+  ]) || BILI_VENV,
   lintDir: E.DSH_CORPUS_LINT_DIR || PIPELINE,
 }
 
@@ -462,11 +469,12 @@ const BILI_SKILL_DIR = E.DSH_BILI_SKILL_DIR || ''
 const BILI_ENGINE_DIR = E.DSH_BILI_ENGINE_DIR
   || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'engine', 'scripts')
 const BILI_ENGINE_KIND = existsSync(join(BILI_ENGINE_DIR, 'bilibili_transcribe.py')) ? 'builtin' : 'external'
-/** 跑 bridge 的解释器：显式 env → 外部技能 venv → DSH 家目录 venv → 系统 Python（需自带 sherpa-onnx 依赖）。 */
+/** 跑 bridge 的解释器：显式 env → ~/.dsh/bili-corpus/.venv（运行时自备）→ DSH 家目录 venv → 系统 Python。 */
 function resolveBiliPython(): string {
   const cands = [
     E.DSH_BILI_PY,
-    BILI_SKILL_DIR ? join(BILI_SKILL_DIR, '.venv', 'Scripts', 'python.exe') : '',
+    BILI_VENV,
+    E.DSH_BILI_SKILL_DIR ? join(E.DSH_BILI_SKILL_DIR, '.venv', 'Scripts', 'python.exe') : '',
     join(HOME, '.dsh', 'speech-to-text', 'venv', 'Scripts', 'python.exe'),
     join(HOME, 'AppData', 'Local', 'Programs', 'Python', 'Python312', 'python.exe'),
   ]
@@ -478,21 +486,32 @@ const PY_BILI = resolveBiliPython()
 const BRIDGE = E.DSH_BILI_BRIDGE || join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'bridge.py')
 // 本地模型（已备好，插件只做存在性检查，绝不自动下载——SKILL.md 明令）。
 const BILI_MODEL_DIR = E.DSH_BILI_MODEL_DIR
+  || firstExisting([
+    join(BILI_HOME, 'models', 'sensevoice-small'),
+    join(BILI_HOME, 'models', 'sensevoice-onnx'),
+    join(HOME, '.dsh', 'speech-to-text', 'sensevoice', 'models', 'sensevoice-onnx'),
+  ])
   || join(HOME, '.dsh', 'speech-to-text', 'sensevoice', 'models', 'sensevoice-onnx')
 const BILI_VAD_MODEL = E.DSH_BILI_VAD_MODEL
+  || firstExisting([
+    join(BILI_HOME, 'models', 'silero', 'silero_vad.onnx'),
+    join(HOME, '.dsh', 'speech-to-text', 'sensevoice', 'models', 'silero', 'silero_vad.onnx'),
+  ])
   || join(HOME, '.dsh', 'speech-to-text', 'sensevoice', 'models', 'silero', 'silero_vad.onnx')
-// ffmpeg/ffprobe：P1 起优先用 ~/.dsh/speech-to-text/ffmpeg（已从会话目录搬出来），
-// 再回退外部技能目录上溯；缺 ffprobe 会被 bridge 直接拦下（静默 300s 预览是历史事故）。
+// ffmpeg：优先运行时自备目录 ~/.dsh/bili-corpus/bin（含 ffmpeg.exe），
+// 其次 DSH 的 speech-to-text/ffmpeg，再回退外部技能目录上溯；都没有就报 ENV。
 function firstExisting(paths: Array<string | undefined>): string {
   for (const p of paths) if (p && existsSync(p)) return p
   return ''
 }
 const BILI_FFMPEG = E.DSH_BILI_FFMPEG
   || firstExisting([
+    join(BILI_HOME, 'bin', 'ffmpeg.exe'),
     join(HOME, '.dsh', 'speech-to-text', 'ffmpeg', 'ffmpeg.exe'),
     BILI_SKILL_DIR ? join(BILI_SKILL_DIR, '..', '..', '..', 'ffmpeg.exe') : '',
   ])
-  || join(HOME, '.dsh', 'speech-to-text', 'ffmpeg', 'ffmpeg.exe')
+  || join(BILI_HOME, 'bin', 'ffmpeg.exe')
+// 2026-11-10：引擎改用 `ffmpeg -i` 取时长，不再需要 ffprobe；此常量仅供旧引擎覆盖时参考。
 const BILI_FFPROBE = E.DSH_BILI_FFPROBE || BILI_FFMPEG.replace('ffmpeg.exe', 'ffprobe.exe')
 const BILI_MODEL_FILE = join(BILI_MODEL_DIR, 'model.int8.onnx')
 

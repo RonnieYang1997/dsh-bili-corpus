@@ -49,6 +49,21 @@ EXPECTED_SIZE = {
     "test_wavs/zh.wav": 178988,
 }
 
+# ---------------------------------------------------------------- silero VAD
+# 切分用的 VAD 模型。与识别权重**分开放**：识别权重落在 --dir，
+# VAD 固定落在 <技能>/models/silero/（脚本与 SKILL.md 都按这个位置找）。
+#
+# 2026-10-15：本机 GitHub release **直连不可达**（curl 返回 000），
+# 故带上两个 GitHub 代理前缀兜底；直连放第一位，网络通的地方优先走直连。
+# 已实测：经代理取到的文件是合法 ONNX，且 sherpa-onnx 能加载。
+VAD_URLS = [
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+    "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+    "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+]
+VAD_DEFAULT_DIR = SKILL_ROOT / "models" / "silero"
+VAD_MIN_SIZE = 300000      # 防"下到了 HTML 错误页"这类假成功
+
 
 def urls_for(rel: str) -> list[str]:
     return [f"{b}/{REPO}/resolve/main/{rel}" for b in HF_BASES]
@@ -183,10 +198,34 @@ def main() -> int:
     ap.add_argument("--skip-verify", action="store_true")
     ap.add_argument("--with-optional", action="store_true",
                     help="连同 test_wavs/zh.wav 一起下载（用于冒烟测试）")
+    ap.add_argument("--vad-dir", default=str(VAD_DEFAULT_DIR),
+                    help="silero VAD 存放目录（默认 <技能>/models/silero）")
+    ap.add_argument("--no-vad", action="store_true",
+                    help="不下载 silero VAD（只取识别权重）")
     args = ap.parse_args()
 
     out = Path(args.dir)
     print(f"[fetch_sensevoice_model] 目标目录 {out}")
+
+    # ---- silero VAD（切分必需，缺了识别会退化成"整段当一句"）
+    if not args.no_vad:
+        vdir = Path(args.vad_dir)
+        vdest = vdir / "silero_vad.onnx"
+        if vdest.exists() and not args.force and vdest.stat().st_size > VAD_MIN_SIZE:
+            print(f"  已存在，跳过 silero_vad.onnx ({vdest.stat().st_size / 1048576:.1f}MB)")
+        else:
+            got_vad = False
+            for u in VAD_URLS:
+                print(f"  下载 {u}")
+                if fetch(u, vdest):
+                    got_vad = True
+                    break
+            if not got_vad:
+                print("  ✗ 无法获取 silero_vad.onnx（可手动下载后放到 "
+                      f"{vdest}）", file=sys.stderr)
+            elif vdest.stat().st_size < VAD_MIN_SIZE:
+                print(f"  ! silero_vad.onnx 体积异常: {vdest.stat().st_size} "
+                      f"(应 > {VAD_MIN_SIZE})", file=sys.stderr)
 
     wanted = list(REQUIRED) + (list(OPTIONAL) if args.with_optional else [])
     ok = True

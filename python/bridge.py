@@ -98,12 +98,14 @@ def main():
             emit({"type": "result", "ok": False, "error": "ENV",
                   "message": "SenseVoice 模型缺失：%s（不要自动下载，按 SKILL.md 用 fetch_sensevoice_model.py）" % ", ".join(missing)})
             return 1
-    # ffmpeg 解析顺序：env（插件注入）→ ~/.dsh/speech-to-text/ffmpeg（本机已备）→ 插件 engine/bin → PATH。
-    # 不再相对「技能目录」上溯——那个会话目录随时会被清掉。
+    # ffmpeg 解析顺序：env（插件注入）→ ~/.dsh/bili-corpus/bin（运行时自备）
+    # → ~/.dsh/speech-to-text/ffmpeg（DSH 自带，本机可能没有）→ 插件 engine/bin → PATH。
     def resolve_ffmpeg():
         home = os.path.expanduser("~")
+        bili_home = os.environ.get("DSH_BILI_HOME") or os.path.join(home, ".dsh", "bili-corpus")
         for c in (os.environ.get("SENSEVOICE_FFMPEG", ""),
                   os.environ.get("DSH_BILI_FFMPEG", ""),
+                  os.path.join(bili_home, "bin", "ffmpeg.exe"),
                   os.path.join(home, ".dsh", "speech-to-text", "ffmpeg", "ffmpeg.exe"),
                   os.path.join(here, "engine", "bin", "ffmpeg.exe")):
             if c and os.path.isfile(c):
@@ -113,15 +115,12 @@ def main():
     ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
         emit({"type": "result", "ok": False, "error": "ENV",
-              "message": "找不到 ffmpeg（放 ~/.dsh/speech-to-text/ffmpeg/ffmpeg.exe 或设 DSH_BILI_FFMPEG）"})
+              "message": "找不到 ffmpeg（放 ~/.dsh/bili-corpus/bin/ffmpeg.exe 或设 DSH_BILI_FFMPEG）"})
         return 1
     bt.FFMPEG = ffmpeg
     os.environ["SENSEVOICE_FFMPEG"] = ffmpeg  # ASR 子进程（sensevoice_asr.py）也靠这个找 ffmpeg
-    ffprobe = ffmpeg.replace("ffmpeg.exe", "ffprobe.exe")
-    if not os.path.isfile(ffprobe) and not shutil.which("ffprobe"):
-        emit({"type": "result", "ok": False, "error": "ENV",
-              "message": "ffprobe 不存在：%s（缺它会让下载静默降级成 300s 预览）" % ffprobe})
-        return 1
+    # 2026-11-10：引擎已改为用 `ffmpeg -i` 取时长，**不再需要 ffprobe**；
+    # 这里保留探测只为兼容旧引擎（外部 DSH_BILI_ENGINE_DIR 覆盖时），缺了不拦。
 
     # 给三个阶段函数套进度上报（原样透传参数/返回值）
     def wrap(name, stage, label):
@@ -137,7 +136,7 @@ def main():
 
     wrap("download_audio", "download", "下载音频（WBI 签名 DASH）")
     wrap("transcribe_long_audio", "asr", "SenseVoice 本地识别")
-    wrap("save_transcript", "save", "写 %s" % (args.name or "dufu-<bvid>.md"))
+    wrap("save_transcript", "save", "写 %s" % (args.name or "<bvid>.md"))
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -145,7 +144,9 @@ def main():
     os.makedirs(temp_dir, exist_ok=True)
 
     # --force：删掉旧稿，让 process_video 重新走全流程（它自己有 <3000 字的缓存判定）
-    target = os.path.join(out_dir, args.name or ("dufu-%s.md" % args.bvid))
+    # 引擎新签名为 name_template（支持 {bvid}/{p} 占位）；插件沿用旧默认 dufu-<bvid>.md。
+    name_tpl = args.name or ("dufu-%s.md" % args.bvid)
+    target = os.path.join(out_dir, name_tpl)
     if args.force and os.path.exists(target):
         try:
             os.remove(target)
@@ -155,7 +156,8 @@ def main():
             return 2
 
     try:
-        result = bt.process_video(args.bvid, output_dir=out_dir, temp_dir=temp_dir, name=args.name)
+        result = bt.process_video(args.bvid, output_dir=out_dir, temp_dir=temp_dir,
+                                  name_template=name_tpl)
         path = result.get("path") or target
         # 别信返回值：落盘校验（非原子写 + 空正文都当失败，防止把半截稿当成功台账）
         if not os.path.isfile(path) or os.path.getsize(path) < 64:

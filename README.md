@@ -133,17 +133,31 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 `python/bridge.py` 默认用**内置引擎**，不再依赖 AionUi 会话里的技能目录（那个目录随时会被清）。
 解析顺序：`DSH_BILI_ENGINE_DIR`（显式）→ 内置 → 外部技能目录（`--skill-dir` / `DSH_BILI_SKILL_DIR`）。
 
-仍然需要的外部资产（都是模型/二进制，不进 git）：
+仍然是**自备的运行时资产**（模型/二进制/解释器，都不进 git）。2026-11-10 起统一放在
+运行时目录 `DSH_BILI_HOME`（默认 `~/.dsh/bili-corpus`）：
 
 | 资产 | 默认位置 | 说明 |
 | --- | --- | --- |
-| Python venv | `~/.dsh/speech-to-text/venv` | 需含 `sherpa_onnx`、`numpy`；缺失时回退外部技能 venv |
-| SenseVoice 模型 | `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx` | `model.int8.onnx` + `tokens.txt` |
+| Python venv | `~/.dsh/bili-corpus/.venv` | 需含 `sherpa_onnx`、`numpy`（`bash scripts/setup.sh` 可自检/补建） |
+| ffmpeg | `~/.dsh/bili-corpus/bin/ffmpeg.exe` | 引擎用 `ffmpeg -i` 取时长，**不再需要 ffprobe** |
+| SenseVoice 模型 | `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx` | `model.int8.onnx` + `tokens.txt`（引擎也会找 `$DSH_BILI_HOME/models/`） |
 | VAD 模型 | `~/.dsh/speech-to-text/sensevoice/models/silero/silero_vad.onnx` | 缺了会分段质量变差 |
-| ffmpeg / ffprobe | `~/.dsh/speech-to-text/ffmpeg/` | 缺 ffprobe 会被 bridge 直接拦下（防静默 300s 预览） |
 
-迁移到另一台机器：插件自带引擎脚本；把上述四样资产按 `DSH_BILI_*` 指过去即可。
+自检（只读，缺什么报什么）：
+
+```bash
+bash scripts/setup.sh --check      # 4 项：解释器 / 模型+VAD / ffmpeg / 结论
+bash scripts/setup.sh              # 缺的解释器与 ffmpeg 会尝试补
+```
+
+迁移到另一台机器：插件自带引擎脚本 + `docs/` 里的方法论；把运行时目录备好（或设
+`DSH_BILI_HOME` 指过去），模型按 `DSH_BILI_MODEL_DIR` / `SENSEVOICE_MODEL_DIR` 指过去即可。
 `bili_jobs` 返回的 `skill.kind` 会显示当前用的是 `builtin` 还是 `external`。
+
+> 2026-11-10：原独立技能目录 `Documents/GitHub/Skills/bilibili-transcribe` 已整体并入本插件
+> （引擎脚本、`calibrate.py`/`merge_rules.py`/`validate_transcript.py`、`SKILL.md` 方法论
+> → `docs/skill-reference.md`、`docs/references/*.md`、`scripts/setup.sh`），并已删除对该目录的
+> 所有硬编码依赖；该目录可以安全删除。
 
 ## 第二个语料 / 多语料（实验）
 

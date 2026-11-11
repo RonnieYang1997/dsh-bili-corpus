@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -50,16 +51,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_ROOT = SCRIPT_DIR.parent
 PLUGIN_ROOT = Path.home() / ".dsh" / "speech-to-text" / "sensevoice" / "models"
 
-# 模型查找顺序：环境变量 → DSH 插件（用户已备好）→ 技能自带兜底
+# 模型查找顺序：环境变量 → **技能自带** → DSH 插件目录（兜底）。
+# 2026-10-15：技能自带提到前面 —— 技能要能独立存活，不能默认指望
+# `~/.dsh` 下那份别的插件的模型一直在（见 fetch_sensevoice_model.py）。
 MODEL_DIR_CANDIDATES = [
     os.environ.get("SENSEVOICE_MODEL_DIR", ""),
-    str(PLUGIN_ROOT / "sensevoice-onnx"),
     str(SKILL_ROOT / "models" / "sensevoice-small"),
+    str(SKILL_ROOT / "models" / "sensevoice-onnx"),
+    str(PLUGIN_ROOT / "sensevoice-onnx"),
 ]
 VAD_CANDIDATES = [
     os.environ.get("SENSEVOICE_VAD_MODEL", ""),
-    str(PLUGIN_ROOT / "silero" / "silero_vad.onnx"),
     str(SKILL_ROOT / "models" / "silero" / "silero_vad.onnx"),
+    str(PLUGIN_ROOT / "silero" / "silero_vad.onnx"),
 ]
 
 # SenseVoice 的富文本标签（<|zh|><|NEUTRAL|><|Speech|><|woitn|>）与事件符号，
@@ -120,17 +124,46 @@ def find_vad_model(explicit: str | None) -> str:
     return first_existing(VAD_CANDIDATES, "VAD 模型")
 
 
+def _runs(exe: str) -> bool:
+    """该可执行文件能否真的跑起来。不用管道（R22：Windows 上管道收尾会卡死）。"""
+    try:
+        r = subprocess.run([exe, "-version"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def find_ffmpeg(explicit: str | None) -> str:
+    """找到**能跑**的 ffmpeg。
+
+    **技能自带优先**（`<技能>/bin/`，见 `fetch_ffmpeg.py`）。
+
+    2026-10-15 两处修正：
+    ① 原实现只查 PATH + 旧的四层布局，且不验证可用性 —— 本机 PATH 上没有 ffmpeg，
+       于是识别在"解码音频"这一步才失败，报错只说"找不到 ffmpeg: ffmpeg"；
+    ② 删掉了去 AionUi/DSH 会话目录里借用别人 ffmpeg.exe 的逻辑 ——
+       那是运行时依赖别人的安装，对方一删/一搬就断。
+    现在覆盖技能自带 + 系统安装，并逐个验证能执行；父进程也会用 --ffmpeg 显式传入。
+    """
     if explicit:
         return explicit
     cands = [
         os.environ.get("SENSEVOICE_FFMPEG", ""),
-        shutil.which("ffmpeg") or "",
-        # BASE_DIR/ffmpeg.exe：采集器的临时目录，既有约定（与 bilibili_transcribe 一致）
+        os.environ.get("FFMPEG", ""),
+        # 技能自带（首选）
+        str(SKILL_ROOT / "bin" / "ffmpeg.exe"),
+        str(SKILL_ROOT / "ffmpeg.exe"),
+        str(SCRIPT_DIR / "ffmpeg.exe"),
+        # 旧约定：BASE_DIR/ffmpeg.exe（脚本往上四层）
         str(SCRIPT_DIR.parent.parent.parent.parent / "ffmpeg.exe"),
+        # 系统级安装（用户自己装的才走这里）
+        str(Path.home() / "scoop" / "shims" / "ffmpeg.exe"),
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        shutil.which("ffmpeg") or "",
     ]
     for c in cands:
-        if c and (shutil.which(c) or os.path.isfile(c)):
+        if c and (shutil.which(c) or os.path.isfile(c)) and _runs(c):
             return c
     return "ffmpeg"
 
@@ -317,6 +350,73 @@ def segment_stats(segs, sr: int) -> dict:
             "med_s": round(d[len(d) // 2], 1), "max_s": round(d[-1], 1)}
 
 
+# ---------------------------------------------------------------- 增益
+
+def rms_dbfs(samples) -> float:
+    """整体 RMS 电平（dBFS）。静音返回 -120，避免 log(0)。"""
+    import numpy as np
+    if not len(samples):
+        return -120.0
+    rms = float(np.sqrt(np.mean(samples.astype("float64") ** 2)))
+    # 下限钳到 -120 dBFS：数字静音在数学上是 -inf，直接返回 -inf 会让
+    # 日志和 JSON 都写不出来，也会让下游的算术变成 nan。
+    return max(-120.0, 20.0 * math.log10(max(rms, 1e-9)))
+
+
+def normalize_gain(samples, target_db: float = -18.0, peak_ceiling: float = 0.98):
+    """把整段音频的 RMS 拉到 target_db，同时按峰值限幅，返回 (samples, info)。
+
+    为什么必须做（2026-10 实测，一次 29 讲的课程录音）：
+
+    ① **没有 VAD、按固定窗口切块**时，录轻的音轨会被整句丢弃：
+       同一段 20 分钟素材，固定 15s 分块
+
+           原样       80 块  63 非空  17 空  1626 字   81 字/分
+           归一化后   80 块  80 非空   0 空  4159 字  208 字/分
+
+       整讲（99 分钟）归一化后空块从 78 降到 1，正文从 8,925 字涨到 18,933 字。
+
+    ② **但带 VAD 的本技能管线上，主要瓶颈不是电平而是 VAD 门限**。
+       同一段 20 分钟音频（−27.7 dBFS）：
+
+           VAD  切分 + 不归一 →  36 段 /  626 字 /  31 字/分
+           VAD  切分 + 归一   →  94 段 / 1513 字 /  76 字/分
+           能量 切分 + 不归一 →  67 段 / 4366 字 / 218 字/分   ← 只换切分就够了
+           能量 切分 + 归一   →  74 段 / 4337 字 / 217 字/分
+
+       归一化把 VAD 从"几乎全聋"抬到"半聋"，而换用能量切分直接回到正常密度
+       （见 transcribe_one 里的自动抢救与 R43）。
+
+    ③ 电平本来健康的音轨几乎不受影响（实测 −26 dBFS 的 3 分钟切片
+       163 → 158 字/分，在噪声范围内）。
+
+    结论：归一化是**便宜且几乎无害的第一步**，值得无条件做；但它不是低电平
+    问题的全部答案，别把它当成"做了就没事了"。真正的杠杆在切分。
+
+    第二个作用：让 `--energy-db` 这个**绝对**阈值重新有意义。无 VAD 的兜底切分
+    按 dBFS 绝对值判静音，录音偏轻时会把正常语音也判成静音（gain 归一后阈值
+    才对应它声称的 -35 dBFS）。所以归一化必须在切分**之前**做。
+    """
+    import numpy as np
+    x = samples.astype("float64")
+    before = rms_dbfs(x)
+    peak = float(np.abs(x).max()) if len(x) else 0.0
+    if peak <= 0.0:
+        return samples, {"gain": 1.0, "before_db": before, "after_db": before,
+                         "peak": 0.0, "clipped": False}
+    goal = 10.0 ** (target_db / 20.0)
+    rms = float(np.sqrt(np.mean(x ** 2))) or 1e-9
+    gain = goal / rms
+    # 限幅：宁可少提一点增益，也不要把波峰削平（削波会制造新的识别错误）
+    limit = peak_ceiling / peak
+    clipped = gain > limit
+    gain = min(gain, limit)
+    out = np.clip(x * gain, -1.0, 1.0).astype("float32")
+    return out, {"gain": round(gain, 4), "before_db": round(before, 1),
+                 "after_db": round(rms_dbfs(out), 1),
+                 "peak": round(peak, 4), "clipped": clipped}
+
+
 # ---------------------------------------------------------------- 引擎
 
 class Engine:
@@ -388,7 +488,9 @@ class Engine:
         buf = int(min(max(60.0, float(seconds) + 10.0), 7200.0))
         return sherpa_onnx.VoiceActivityDetector(self.vad_cfg, buffer_size_in_seconds=buf)
 
-    def split(self, samples, sr: int):
+    def split(self, samples, sr: int, force_energy: bool = False):
+        if force_energy:
+            return segments_via_energy(samples, sr), "energy"
         if self.vad is not None:
             import sherpa_onnx
             vad = self._new_vad(sherpa_onnx, len(samples) / float(sr or 16000))
@@ -409,9 +511,10 @@ class Engine:
             err("[sensevoice] VAD 未检出语音段，退化为能量切分")
         return segments_via_energy(samples, sr), "energy"
 
-    def split_capped(self, samples, sr: int, cap_sec: float, pad_sec: float):
+    def split_capped(self, samples, sr: int, cap_sec: float, pad_sec: float,
+                     force_energy: bool = False):
         """切分 →（VAD 时）补边距 → 强制单段上限；返回 (segs, 来源, 统计)。"""
-        segs, how = self.split(samples, sr)
+        segs, how = self.split(samples, sr, force_energy=force_energy)
         if how == "vad":
             segs = pad_segments(segs, len(samples), sr, pad_sec)
         before = len(segs)
@@ -428,6 +531,30 @@ class Engine:
         return s.result.text or ""
 
 
+def _transcribe_segments(engine, samples, sr, segs, args, quiet: bool = False):
+    """逐段识别，返回 (parts, raws, 空段数, 说话人标签样本)。
+
+    说话人标签留证用：语音转写平台给的分轨常常是错的（同一个人会在半句中间换编号），
+    留着是为了事后能证明"错在哪一层"，不是为了使用。
+    """
+    parts, raws, speaker_hits = [], [], []
+    empty = 0
+    for k, seg in enumerate(segs):
+        t = engine.transcribe(samples, sr, seg)
+        if args.debug_raw:
+            raws.append(t)
+        c = clean_text(t)
+        if c:
+            parts.append(c)
+        else:
+            empty += 1
+        if args.debug_raw and re.search(r"说话人|speaker", t):
+            speaker_hits.append(t[:80])
+        if not quiet and (k + 1) % 20 == 0:
+            log("[sensevoice]   已识别 %d/%d 段" % (k + 1, len(segs)))
+    return parts, raws, empty, speaker_hits
+
+
 def transcribe_one(engine: Engine, ffmpeg: str, src: str, tmpdir: str,
                    args) -> dict:
     if not os.path.isfile(src):
@@ -437,24 +564,74 @@ def transcribe_one(engine: Engine, ffmpeg: str, src: str, tmpdir: str,
     decode_to_wav(ffmpeg, src, wav)
     samples, sr = read_wav_float32(wav)
     dur = len(samples) / sr if sr else 0.0
+
+    # 增益归一化必须在切分之前：既决定模型会不会整句丢字，也决定
+    # --energy-db 这个绝对阈值是否对得上它声称的电平（见 normalize_gain）。
+    ginfo = None
+    if not getattr(args, "no_normalize", False):
+        target = getattr(args, "target_db", -18.0)
+        samples, ginfo = normalize_gain(samples, target_db=target)
+        log("[sensevoice] %s  增益 x%.2f (%.1f → %.1f dBFS)%s"
+            % (os.path.basename(src), ginfo["gain"], ginfo["before_db"],
+               ginfo["after_db"], "  [峰值限幅]" if ginfo["clipped"] else ""))
+
     segs, how, sstat = engine.split_capped(samples, sr, args.segment_seconds,
                                           args.pad_seconds)
     log("[sensevoice] %s  时长 %.1fs  切分=%s  段数=%d (最短%.1fs/中位%.1fs/最长%.1fs)"
         % (os.path.basename(src), dur, how, sstat["n"],
            sstat["min_s"], sstat["med_s"], sstat["max_s"]))
 
-    parts, raws = [], []
-    for k, seg in enumerate(segs):
-        t = engine.transcribe(samples, sr, seg)
-        if args.debug_raw:
-            raws.append(t)
-        c = clean_text(t)
-        if c:
-            parts.append(c)
-        if (k + 1) % 20 == 0:
-            log("[sensevoice]   已识别 %d/%d 段" % (k + 1, len(segs)))
+    parts, raws, empty, speaker_hits = _transcribe_segments(
+        engine, samples, sr, segs, args)
 
     text = clean_text("".join(parts))
+    mins = dur / 60.0 if dur else 0.0
+    cpm = round(len(text) / mins, 1) if mins else 0.0
+
+    # ---- VAD 漏检的自动抢救 ----------------------------------------------
+    # 实测（2026-10，一段 −27.7 dBFS 的讲座录音，20 分钟）：
+    #     VAD  切分 + 不归一 →  36 段 /  626 字 /  31 字/分
+    #     VAD  切分 + 归一   →  94 段 / 1513 字 /  76 字/分
+    #     能量 切分 + 不归一 →  67 段 / 4366 字 / 218 字/分   ← 只换切分就够了
+    #     能量 切分 + 归一   →  74 段 / 4337 字 / 217 字/分
+    # 结论：**低电平时真正拖后腿的是 silero VAD 的门限，不是识别模型。**
+    # 归一化只能把 VAD 从"几乎全聋"抬到"半聋"，换成能量切分则直接回到正常密度。
+    # 所以不指望用户调参：检测到"段数异常少"，就自动用能量切分重跑一遍，取字多者。
+    retried = None
+    if (how == "vad" and dur > 120 and mins
+            and (len(segs) < 4.0 * mins or cpm < 120)
+            and not getattr(args, "no_auto_energy", False)):
+        err("[sensevoice] 警告：VAD 只切出 %d 段（%.1f 段/分钟）、密度 %.0f 字/分，"
+            "疑似低电平漏检；改用能量切分重跑 …"
+            % (len(segs), len(segs) / mins, cpm))
+        segs2, how2, sstat2 = engine.split_capped(
+            samples, sr, args.segment_seconds, args.pad_seconds, force_energy=True)
+        parts2, raws2, empty2, hits2 = _transcribe_segments(
+            engine, samples, sr, segs2, args, quiet=True)
+        text2 = clean_text("".join(parts2))
+        cpm2 = round(len(text2) / mins, 1) if mins else 0.0
+        retried = {"split": how2, "segments": len(segs2),
+                   "chars": len(text2), "chars_per_min": cpm2}
+        if len(text2) > len(text):
+            log("[sensevoice]   采用能量切分：%d → %d 字（%.0f → %.0f 字/分）"
+                % (len(text), len(text2), cpm, cpm2))
+            segs, how, sstat = segs2, how2, sstat2
+            parts, raws, empty, speaker_hits = parts2, raws2, empty2, hits2
+            text, cpm = text2, cpm2
+        else:
+            log("[sensevoice]   能量切分没有更好（%d 字），保留 VAD 结果" % len(text2))
+
+    # 密度是"模型有没有整句丢字"的唯一廉价指示：中文讲课正常 190–260 字/分。
+    # 短视频必须豁免（与 R34 的缓存判定同一个 120s 阈值）：片头/通知/纯音乐
+    # 本来就只该出几个字，拿密度去要求它是误报（R33 已记过同一类教训）。
+    if dur > 120 and segs and empty > len(segs) * 0.15:
+        err("[sensevoice] 警告：%s 有 %d/%d 段识别为空（%.0f%%），"
+            "正文密度仅 %.0f 字/分。可能是音频偏轻/噪声。"
+            % (os.path.basename(src), empty, len(segs),
+               100.0 * empty / len(segs), cpm))
+    elif dur > 120 and cpm < 120:
+        err("[sensevoice] 警告：%s 正文密度仅 %.0f 字/分（中文讲课正常 190–260），"
+            "请核对音频质量（R38）" % (os.path.basename(src), cpm))
     if not args.keep_temp:
         try:
             os.remove(wav)
@@ -464,6 +641,11 @@ def transcribe_one(engine: Engine, ffmpeg: str, src: str, tmpdir: str,
         "file": src,
         "seconds": round(dur, 2),
         "segments": len(segs),
+        "empty_segments": empty,
+        "chars_per_min": cpm,
+        "gain": ginfo,
+        "auto_energy_retry": retried,
+        "speaker_tags_seen": speaker_hits,
         "split": how,
         "seg_stats": sstat,
         "chars": len(text),
@@ -488,6 +670,12 @@ def main() -> int:
                     help="VAD 段前后补的静音余量，找回被削掉的起始音节")
     ap.add_argument("--vad-chunk", type=int, default=0, help="喂给 VAD 的分块大小，0=自动")
     ap.add_argument("--energy-db", type=float, default=-35.0)
+    ap.add_argument("--target-db", type=float, default=-18.0,
+                    help="增益归一的 RMS 目标电平（dBFS），默认 -18")
+    ap.add_argument("--no-normalize", action="store_true",
+                    help="关闭增益归一（默认开启，几乎总是应该让它开着）")
+    ap.add_argument("--no-auto-energy", action="store_true",
+                    help="关闭\"VAD 漏检时自动改用能量切分\"的抢救（默认开启）")
     ap.add_argument("--json-out", default=None, help="结果（含计时/raw）写 JSON")
     ap.add_argument("--keep-temp", action="store_true")
     ap.add_argument("--debug-raw", action="store_true",
@@ -555,9 +743,14 @@ def main() -> int:
     sys.stdout.flush()
     total_s = sum(r["seconds"] for r in results)
     total_e = sum(r["elapsed"] for r in results)
-    log("[sensevoice] 完成：音频 %.1fs / 用时 %.1fs / RTF %.3f / %d 字 / 切分=%s"
-        % (total_s, total_e, (total_e / total_s) if total_s else 0,
-           sum(r["chars"] for r in results), results[0]["split"]))
+    total_c = sum(r["chars"] for r in results)
+    mins = total_s / 60.0 if total_s else 0
+    log("[sensevoice] 完成：音频 %.1fs / 用时 %.1fs / RTF %.3f / %d 字 "
+        "(%.0f 字/分) / 空段 %d/%d / 切分=%s"
+        % (total_s, total_e, (total_e / total_s) if total_s else 0, total_c,
+           (total_c / mins) if mins else 0,
+           sum(r["empty_segments"] for r in results),
+           sum(r["segments"] for r in results), results[0]["split"]))
     return 0
 
 
