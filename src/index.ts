@@ -709,7 +709,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   // ── 进程内状态（互斥锁 + 门禁记忆 + 累计 token）
-  let inFlight: { kind: string; batch: number; phase: string; startedAt: string } | null = null
+  let inFlight: { corpus?: string; kind: string; batch: number; phase: string; startedAt: string } | null = null
   let lastGate: { ok: boolean; at: string; lintRc: number; lintPass: boolean; selftestPass: boolean } | null = null
   let lastBatch: Record<string, unknown> | null = null
   let gateBlocked = false
@@ -1287,7 +1287,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     // 复用上一轮 dryRun 的补丁直接落地：省掉整轮 LLM（4 篇 ≈ 34 次调用 / 近 1 小时）。
     if (opts.applyOnly) return await runApplyOnlyError(batchNo)
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'queue', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'queue', startedAt: nowIso() }
     const qArgs = [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)]
     if (opts.only) qArgs.push('--only', String(opts.only))
     // 精修：把这几篇从「已完成」里捞回来重跑（queue 的 --redo 收的是稿件 id 列表）
@@ -1321,7 +1321,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const t0 = Date.now()
     for (const item of queue) {
       const bvid = String(item.bvid)
-      inFlight = { kind: 'error', batch: batchNo, phase: `llm ${patched + empty + noPatch + 1}/${queue.length} ${bvid}`, startedAt: nowIso() }
+      inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: `llm ${patched + empty + noPatch + 1}/${queue.length} ${bvid}`, startedAt: nowIso() }
       const r = await processDoc(batchNo, bvid)
       if (r === 'patched') patched += 1
       else if (r === 'empty') empty += 1
@@ -1338,7 +1338,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       }
     }
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'verify', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'verify', startedAt: nowIso() }
     const ver = run(P().python, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: SCRIPT_CWD, timeoutMs: 900000 })
     if (ver.rc !== 0) {
       return {
@@ -1348,7 +1348,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       }
     }
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'apply', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const patchDir = join(patchRoot(), `batch-${batchNo}`)
     const reportFile = join(P().state, `report-batch-${batchNo}.json`)
     const applyArgs = [
@@ -1372,7 +1372,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       }
     }
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'gates', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'gates', startedAt: nowIso() }
     const gate = runGates()
     const result: Record<string, unknown> = {
       ok: Boolean(gate.pass),
@@ -1416,7 +1416,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     }
     const queue = readJson<Array<{ bvid: string }>>(qf, [])
     const t0 = Date.now()
-    inFlight = { kind: 'error', batch: batchNo, phase: 'apply(reuse)', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'apply(reuse)', startedAt: nowIso() }
     const reportFile = join(P().state, `report-batch-${batchNo}.json`)
     const ap = run(P().python, [
       APPLY_SCRIPT, '--dir', pd, '--snap', snapFile, '--report', reportFile, '--drop-bad',
@@ -1429,7 +1429,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     if (rec.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'record', status: 'FAILED', error: `record rc=${rec.rc}`, tail: tail(rec.out) }
     }
-    inFlight = { kind: 'error', batch: batchNo, phase: 'gates', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'gates', startedAt: nowIso() }
     const gate = runGates()
     const result: Record<string, unknown> = {
       ok: Boolean(gate.pass),
@@ -1485,7 +1485,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     // 同上：标点脚本也按两副本工作，先把存档里的稿补进落点。
     const hyd = hydrateDocs(queue.map((x) => String(x.bvid)))
     if (hyd.copied > 0) log(`punct 批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
-    inFlight = { kind: 'punct', batch: batchNo, phase: 'local-model', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'punct', batch: batchNo, phase: 'local-model', startedAt: nowIso() }
     const local = run(P().pythonAsr, [PUNCT_LOCAL, '--batch', String(batchNo)], {
       cwd: SCRIPT_CWD,
       timeoutMs: Number(E.DSH_CORPUS_PUNCT_TIMEOUT_MS || 4 * 3600 * 1000),
@@ -1493,7 +1493,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     if (local.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'punct', phase: 'local', status: 'FAILED', error: `punct_local rc=${local.rc}`, tail: tail(local.out) }
     }
-    inFlight = { kind: 'punct', batch: batchNo, phase: 'apply', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'punct', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const applyArgs = [PUNCT_APPLY, '--batch', String(batchNo)]
     if (opts.dryRun) applyArgs.push('--dry-run')
     const ap = run(P().python, applyArgs, { cwd: SCRIPT_CWD, timeoutMs: 1800000 })
@@ -1503,7 +1503,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const report = readJson<Array<Record<string, any>>>(join(P().state, `report-punct-${batchNo}.json`), [])
     const landed = report.filter((r) => r && r.ok).length
     const rejected = report.filter((r) => r && !r.ok).length
-    inFlight = { kind: 'punct', batch: batchNo, phase: 'gates', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'punct', batch: batchNo, phase: 'gates', startedAt: nowIso() }
     const gate = runGates()
     const result: Record<string, unknown> = {
       ok: Boolean(gate.pass),
@@ -1529,7 +1529,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
   /** 批次互斥 + 门禁闸门 + 暂停闸门。 */
   async function runBatch(kind: string, opts: { size?: number; batch?: number; dryRun?: boolean; corpus?: string; only?: string; applyOnly?: boolean; redo?: boolean }): Promise<Record<string, unknown>> {
-    if (inFlight) return { ok: false, error: 'BUSY', detail: inFlight, message: '同一时刻只允许一个批次在跑' }
+    if (inFlight) return { ok: false, error: 'BUSY', detail: inFlight, message: `同一时刻只允许一个批次在跑（持有者语料 ${inFlight.corpus || '?'}）` }
     if (isPaused()) return { ok: false, error: 'PAUSED', message: '驾驶舱已暂停（corpus_paused.flag 存在）——先 corpus_resume' }
     if (gateBlocked) {
       return {

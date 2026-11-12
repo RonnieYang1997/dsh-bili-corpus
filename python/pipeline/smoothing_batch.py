@@ -115,6 +115,14 @@ def cmd_queue(a):
                   % (k, age_h, stale_h, ",".join(b.get("queued") or [])[:160]))
             continue
         inflight.update(b.get("queued") or [])
+    # --redo 收的是逗号分隔的稿子标识，但实际 id 是「009 商品的人格化…」这种整串，
+    # 所以按前缀/子串匹配（精确比对会让 redo 永远落空，实测 2026-11-12）。
+    _redo_raw = (getattr(a, "redo", None) or "").strip()
+    _redo_pats = [p.strip() for p in _redo_raw.split(",") if p.strip()]
+
+    def _is_redo(bvid):
+        return any(p == bvid or bvid.startswith(p) or p in bvid for p in _redo_pats)
+
     n_done = 0
     n_inflight = 0
     for f in sorted(_cp.iter_names()):
@@ -124,8 +132,7 @@ def cmd_queue(a):
         if bvid in inflight:
             n_inflight += 1
             continue
-        if led["docs"].get(bvid, {}).get("status") in DONE_STATUS and bvid not in (
-                a.redo.split(",") if a.redo else []):
+        if led["docs"].get(bvid, {}).get("status") in DONE_STATUS and not _is_redo(bvid):
             n_done += 1
             continue
         meta = doc_meta(f)
