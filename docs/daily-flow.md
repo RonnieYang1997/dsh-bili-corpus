@@ -80,6 +80,10 @@ NIGHTLY-RESULT: ok discovered=N transcribed=N batches=N patches=N pending=0 gate
 8. **ffprobe 路径推导**：`ffprobe_duration()` 曾经用整串 `replace("ffmpeg","ffprobe")` 推路径，而本机目录就叫 `ffmpeg`（`~/.dsh/speech-to-text/ffmpeg/`），目录名也被替换成 `ffprobe` → `FileNotFoundError [WinError 2]`。表现为**长稿整单失败**（29 分钟那篇连挂三次），而短稿因为走 FLV 兜底 + API 时长而「看起来正常」。现已修成 `_ffprobe_path()`（只换 basename + 兜底 `shutil.which`）；同类代码不要再对整串做 replace。
 9. **充电专属不记账**：`charging_videos.json` 是「哪些稿子因为没充电权限没拿到」的唯一账本（10-31 那次 173 条里查出 12 条缺稿全靠它）。`discover.py` 的 `add_charging_bvids()` 曾只有定义没有调用者，转写判出 `stage=CHARGING` 的稿子从不入账，视频滑出 7 天窗口后就再无痕迹。现由 `python/bridge.py` 在 `code == "CHARGING"` 分支自动写入并同步镜像（2026-11-03 起）。自查：`charging_videos.json` 的条数应随每日 CHARGING 失败递增。
 10. **手动删稿会留死索引**：`bili_transcribe` 归档时会给两处 `MEMORY.md` 各补一行，但**没有「删稿」工具**。手动删掉 `dufu-<bvid>.md`（或 `git clean` 清掉未跟踪文件）后，索引行还在，次日 `corpus_gates` 直接报 `MEMORY.md 索引指向不存在的文件`。处理：把两处 `MEMORY.md` 里对应的 `- dufu-<bvid>` 行删掉（`encoding="utf-8"` 无 BOM），再跑 `corpus_gates` 复核。2026-11-04 23:06 手动转的《植物油如何打败黄油和猪油？…｜有佑 U_NoKnow》就是这么留下的死索引。
+11. **模型偶尔顺手改标点**：守卫只拦「加标点」的 stutter 补丁，`kind=homophone/name` 的整句替换里夹带标点改动是会放行的。2026-11-08 批 221 有 1 条把原稿「是必然。必需要在」写成「是必然，必需要在」（句号改逗号），靠人工复核发现，已用 `fix-221` 还原成「是必然。」。收尾抽查时留意 `report-batch-N.json` 里 find/replace 的标点是否变了；要修就只保留词形替换、把原标点照抄回去。
+12. **专名可能被改成「更有名」的错答案**：模型倾向于把生僻专名改成它更熟悉的实体。2026-11-09 批 222 把 UP 主自称「独夫老师」改成了「杜甫老师」（因为杜甫是名人），方向正好反了——作者名的正解永远是**独夫之心 / 独夫老师**，任何「杜甫/读副/毒夫」都要改成「独夫」。同类高危：`滔搏`（不是滔博）、`韩援`（不是韩元）、`朱门酒肉臭，路有冻死骨`。收尾抽查专名类补丁时，先问一句「这个方向对不对」再看字面。
+13. **成语/惯用语要回到词典形**：模型修同音错字时容易「补字补过头」。2026-11-10 批 223 把「有地放矢」改成「有**目的**放矢」，正解是「有**的**放矢」；同理注意「寅吃卯粮」「朝不保夕」「啼笑皆非」「纡尊降贵」。收尾抽查时，成语、惯用语、固定搭配单列一眼，比照词典而不是凭语感。
+14. **作者名会被改成「更有名的名字」——已从提示词层根治**：2026-11-11 批 224 第三次出现「读甫老师 → 杜甫老师」。现在 `src/index.ts` 的 `SYSTEM_PROMPT` 第 9 条写死「作者自称固定是 独夫老师/独夫之心，杜甫/读甫/读副/毒夫 一律改回」，第 10 条写死「成语回到词典形，别补字过头（有地放矢→有的放矢）」。改动提示词属于稳定块：改完必须 `bash scripts/build.sh` + `dev_reload_package`，并 grep `lib/index.js` 确认新句子进了产物，否则跑的还是旧提示词。
 
 ## Cookie（充电专属 / 会员视频）
 
