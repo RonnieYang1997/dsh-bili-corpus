@@ -1061,7 +1061,11 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const j = t.lastIndexOf('}')
     if (i < 0 || j <= i) throw new Error('未找到 JSON 对象')
     const obj = JSON.parse(t.slice(i, j + 1)) as Record<string, unknown>
-    if (obj.bvid && String(obj.bvid) !== bvid) throw new Error(`bvid 不匹配（${String(obj.bvid)}）`)
+    if (obj.bvid && String(obj.bvid) !== bvid) {
+      // 以前这里直接 throw，结果模型回显了别的编号就整片作废（016 连废 4 片）。
+      // 真正把关的是下面逐条 body.includes(find)，所以只记日志不拦。
+      log(`注意：模型回显 bvid=${String(obj.bvid)}，与请求的 ${bvid} 不一致，按 find/replace 校验结果为准`)
+    }
     const list = Array.isArray(obj.patches) ? obj.patches : null
     if (list === null) throw new Error('缺 patches 数组')
     const out: Array<Record<string, unknown>> = []
@@ -1140,7 +1144,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
    * 无退避的瞬间重试烧掉的（503 circuit open，92 次调用 12 分钟全废）。
    */
   const isTransportError = (e: unknown): boolean =>
-    /SERVER 5\d\d|connect-timeout|circuit open|ETIMEDOUT|ECONNRESET|socket hang up|fetch failed|net::ERR/i.test(String(e))
+    /SERVER 5\d\d|connect-timeout|circuit open|ETIMEDOUT|ECONNRESET|socket hang up|fetch failed|net::ERR|inactive context/i.test(String(e))
   const backoffSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
   /** 单篇：读正文 → LLM → 解析（失败重试 1 次）→ 写补丁文件。任何失败只记 no_patch。 */
@@ -1198,6 +1202,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     for (let ci = 0; ci < chunks.length; ci += 1) {
       const chunk = chunks[ci]
       const tag = chunks.length > 1 ? `[${ci + 1}/${chunks.length}] ` : ''
+      let split = false
       const user = `bvid: ${bvid}\n文件: ${file}\n${tag}\n${chunk}`
       let part: Array<Record<string, unknown>> | null = null
       let maxTokens = LLM_MAX_TOKENS
@@ -1222,9 +1227,19 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             const waitMs = [5000, 20000][Math.min(attempt - 1, 1)]
             log(`上游不可用，等待 ${Math.round(waitMs / 1000)}s 后重试（${bvid}${tag}）`)
             await backoffSleep(waitMs)
+          } else if (cut && chunk.length > 2500 && attempt === 2) {
+            // 截断的真正原因是「一片里要吐的补丁太多」，不是 maxTokens 不够。
+            // 把这一个片对半劈开插回队首，两半各自只需一半输出。
+            const mid = Math.floor(chunk.length / 2)
+            const cutAt = chunk.lastIndexOf('\n', mid) > 0 ? chunk.lastIndexOf('\n', mid) : mid
+            chunks.splice(ci + 1, 0, chunk.slice(0, cutAt), chunk.slice(cutAt))
+            log(`输出被截断，切片对半重试（${bvid}${tag} ${chunk.length}→${cutAt}+${chunk.length - cutAt} 字）`)
+            split = true
+            break
           } else if (cut) maxTokens = Math.min(maxTokens * 2, 64000)
         }
       }
+      if (split) continue
       if (part === null) { failedChunks += 1; continue }
       for (const p of part) {
         const key = `${String(p.find)}\u0000${String(p.replace)}`
