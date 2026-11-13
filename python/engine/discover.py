@@ -77,6 +77,13 @@ from bilibili_transcribe import get_wbi_key, wbi_sign, COOKIE, SSL_CTX  # noqa: 
 
 MID = 10850097
 GAMING_KEYWORDS = ['黑神话悟空', '黑神话', '打游戏', '勇闯', '游戏实况', '游戏直播', '电竞']
+
+# ── 用户不收录的主题（2026-11-12 加，用户口径：「NBA 和 LOL 的信息我不关注，不要收录」） ──
+# 只认**标题里明确指向 NBA / 英雄联盟赛事**的词，宁漏勿误杀。
+# ⚠️ 千万别加 'LOL'：UP 主的「LOL之日报」「LOL之艾欧尼亚」等是**时政节目**用游戏地图做比喻，
+#    不是英雄联盟内容，加进去会把时政日报全挡掉。
+TOPIC_KEYWORDS = ['NBA', '湖人', '勇士', '库里', '篮球', 'LPL', 'LCK',
+                  '英雄联盟', 'S赛', 'MSI', '全球总决赛']
 WINDOW_DAYS = 7
 
 # ── 带货/广告过滤（2026-10-20 加） ─────────────────────────────────────
@@ -363,6 +370,7 @@ def pick_new(videos, days=None):
     cutoff = datetime.now() - timedelta(days=int(days or WINDOW_DAYS))
     new_videos, skipped_gaming = [], 0
     skipped_ad = []
+    skipped_topic = []
     for v in videos:
         try:
             created = datetime.fromtimestamp(v['created'])
@@ -387,6 +395,11 @@ def pick_new(videos, days=None):
             gaming.add(bvid)
             skipped_gaming += 1
             continue
+        hit = next((kw for kw in TOPIC_KEYWORDS if kw in title), None)
+        if hit:
+            excluded.add(bvid)      # 记进手工排除清单，跨窗口也不会再回来
+            skipped_topic.append((bvid, title, hit))
+            continue
         why = ad_reason(v)
         if why:
             skipped_ad.append((bvid, title, why))
@@ -396,6 +409,10 @@ def pick_new(videos, days=None):
         log_line("  跳过带货/广告/碎片 %d 篇：" % len(skipped_ad))
         for bvid, title, why in skipped_ad:
             log_line("    %s  %s  ← %s" % (bvid, title[:36], why))
+    if skipped_topic:
+        log_line("  跳过不收录主题（NBA/英雄联盟）%d 篇：" % len(skipped_topic))
+        for bvid, title, kw in skipped_topic:
+            log_line("    %s  %s  ← %s" % (bvid, title[:36], kw))
     # 缓存回写（语料根 + 仓库镜像）
     _save_bvids(CHARGING_CACHE, charging)
     _save_bvids(GAMING_CACHE, gaming)
