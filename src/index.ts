@@ -146,7 +146,10 @@ function loadProfiles(): Record<string, CorpusProfile> {
   }
   PROFILES = out
   const saved = readJsonFile<{ active?: string }>(ACTIVE_FILE, {})
-  const want = String((cfg && cfg.default) || saved.active || ACTIVE_ID)
+  // 优先级：用户显式切过的 active（active-corpus.json）> corpora.json 的 default > 进程内初值。
+  // 反过来写会让「重载插件/重启宿主」把语料打回 default——2026-11-11 就这样在 malie 上
+  // 白跑了一整批 006–009（20 次调用），corpus=capital 的批次却什么都没写。
+  const want = String(saved.active || (cfg && cfg.default) || ACTIVE_ID)
   ACTIVE_ID = out[want] ? want : base.id
   return out
 }
@@ -535,6 +538,9 @@ const PUNCT_APPLY = join(SCRIPT_DIR, 'punct_apply.py')
 const DONE_STATUS = new Set(['done', 'already', 'empty', 'skip'])
 const KINDS = new Set(['homophone', 'name', 'stutter', 'number', 'punct', 'other'])
 const BODY_LIMIT = Number(E.DSH_CORPUS_BODY_LIMIT || 60000)
+// 长稿分片大小（字）。模型单次输出补丁有上限，2.9 万字正文一口气喂进去必然截断；
+// 12000 字一片 ≈ 9k 输入 tokens，输出通常 3–6k，留足余量。
+const CHUNK_CHARS = Number(E.DSH_CORPUS_CHUNK_CHARS || 12000)
 /** 单篇补丁输出的 token 预算：4000 会被推理 token 吃光导致 JSON 截断（2026-10-31 实测）。 */
 const LLM_MAX_TOKENS = Number(E.DSH_CORPUS_MAX_TOKENS || 16000)
 const AUTO = /^(1|true|yes|on)$/i.test(String(E.DSH_CORPUS_AUTO || ''))
@@ -703,7 +709,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   // ── 进程内状态（互斥锁 + 门禁记忆 + 累计 token）
-  let inFlight: { kind: string; batch: number; phase: string; startedAt: string } | null = null
+  let inFlight: { corpus?: string; kind: string; batch: number; phase: string; startedAt: string } | null = null
   let lastGate: { ok: boolean; at: string; lintRc: number; lintPass: boolean; selftestPass: boolean } | null = null
   let lastBatch: Record<string, unknown> | null = null
   let gateBlocked = false
@@ -1055,7 +1061,11 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const j = t.lastIndexOf('}')
     if (i < 0 || j <= i) throw new Error('未找到 JSON 对象')
     const obj = JSON.parse(t.slice(i, j + 1)) as Record<string, unknown>
-    if (obj.bvid && String(obj.bvid) !== bvid) throw new Error(`bvid 不匹配（${String(obj.bvid)}）`)
+    if (obj.bvid && String(obj.bvid) !== bvid) {
+      // 以前这里直接 throw，结果模型回显了别的编号就整片作废（016 连废 4 片）。
+      // 真正把关的是下面逐条 body.includes(find)，所以只记日志不拦。
+      log(`注意：模型回显 bvid=${String(obj.bvid)}，与请求的 ${bvid} 不一致，按 find/replace 校验结果为准`)
+    }
     const list = Array.isArray(obj.patches) ? obj.patches : null
     if (list === null) throw new Error('缺 patches 数组')
     const out: Array<Record<string, unknown>> = []
@@ -1128,8 +1138,42 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     return checked
   }
 
+  /**
+   * 传输层故障（上游 503 / 连接超时 / 熔断）与「模型输出不是合法 JSON」是两回事：
+   * 前者退避后重试有意义，后者要改提示词或缩片。2026-11-11 一整批 4 篇就是这样被
+   * 无退避的瞬间重试烧掉的（503 circuit open，92 次调用 12 分钟全废）。
+   */
+  const isTransportError = (e: unknown): boolean =>
+    /SERVER 5\d\d|connect-timeout|circuit open|ETIMEDOUT|ECONNRESET|socket hang up|fetch failed|net::ERR|inactive context/i.test(String(e))
+  const backoffSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
   /** 单篇：读正文 → LLM → 解析（失败重试 1 次）→ 写补丁文件。任何失败只记 no_patch。 */
-  async function processDoc(batchNo: number, bvid: string): Promise<'patched' | 'empty' | 'no_patch'> {
+  /**
+   * 正文切片：优先在段落边界断，单片不超过 max 字。
+   * 单段落超长时硬切（宁可切断一句，也比整篇喂进去被截断强）。
+   */
+  function splitChunks(body: string, max: number): string[] {
+    if (!body) return []
+    if (body.length <= max) return [body]
+    const out: string[] = []
+    let cur = ''
+    const paras = body.split(/(\r?\n\r?\n+)/)
+    for (const para of paras) {
+      if (cur && cur.length + para.length > max) {
+        out.push(cur)
+        cur = ''
+      }
+      cur += para
+      while (cur.length > max) {
+        out.push(cur.slice(0, max))
+        cur = cur.slice(max)
+      }
+    }
+    if (cur.trim()) out.push(cur)
+    return out.filter((c) => c.trim().length > 0)
+  }
+
+  async function processDoc(batchNo: number, bvid: string): Promise<'patched' | 'empty' | 'no_patch' | 'unavailable'> {
     const file = findDoc(bvid)
     if (!file) {
       log(`找不到稿件 ${bvid}（新稿落点/存档都没有）`)
@@ -1145,30 +1189,69 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const fm = raw.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)
     const offset = fm ? fm[0].length : 0
     const body = raw.slice(offset).slice(0, BODY_LIMIT)
-    const user = `bvid: ${bvid}\n文件: ${file}\n\n${body}`
-    let patches: Array<Record<string, unknown>> | null = null
-    let parsed: string | null = null
-    let maxTokens = LLM_MAX_TOKENS
-    for (let attempt = 1; attempt <= 3 && patches === null; attempt += 1) {
-      try {
-        const sys = attempt === 1
-          ? SYSTEM_PROMPT
-          : `${SYSTEM_PROMPT}\n\n注意：上一次输出不是合法 JSON（可能是输出过长被截断）。这一次**只输出一个 JSON 对象**，不要任何多余文字。`
-        const r = await callLlm(sys, user, maxTokens)
-        parsed = r.text
-        patches = parsePatches(r.text, bvid)
-        if (r.usage && r.usage.output >= maxTokens - 32) {
-          log(`注意 ${bvid}：输出贴近 token 上限（${r.usage.output}/${maxTokens}），若补丁偏少请人工复核`)
+    // 长稿分片：单次调用要模型一次吐出全部补丁，实测 2.9 万字正文会让输出撞上
+    // 模型自己的上限（~16k tokens）→ JSON 截断 → 三次都解析失败 → no_patch。
+    // 按段落切成 CHUNK_CHARS 一片，逐片出补丁再合并（补丁是 find/replace，
+    // 只要 find 逐字存在于正文就能落地，合并天然安全）。
+    const chunks = splitChunks(body, CHUNK_CHARS)
+    const all: Array<Record<string, unknown>> = []
+    const seen = new Set<string>()
+    let failedChunks = 0
+    let parsedLen = 0
+    let transportOnly = true
+    for (let ci = 0; ci < chunks.length; ci += 1) {
+      const chunk = chunks[ci]
+      const tag = chunks.length > 1 ? `[${ci + 1}/${chunks.length}] ` : ''
+      let split = false
+      const user = `bvid: ${bvid}\n文件: ${file}\n${tag}\n${chunk}`
+      let part: Array<Record<string, unknown>> | null = null
+      let maxTokens = LLM_MAX_TOKENS
+      for (let attempt = 1; attempt <= 3 && part === null; attempt += 1) {
+        try {
+          const sys = attempt === 1
+            ? SYSTEM_PROMPT
+            : `${SYSTEM_PROMPT}\n\n注意：上一次输出不是合法 JSON（可能是输出过长被截断）。这一次**只输出一个 JSON 对象**，不要任何多余文字。`
+          const r = await callLlm(sys, user, maxTokens)
+          parsedLen += r.text.length
+          part = parsePatches(r.text, bvid)
+          if (r.usage && r.usage.output >= maxTokens - 32) {
+            log(`注意 ${bvid}：输出贴近 token 上限（${r.usage.output}/${maxTokens}），若补丁偏少请人工复核`)
+          }
+        } catch (e) {
+          const transport = isTransportError(e)
+          const cut = /未找到 JSON 对象|Unterminated|Unexpected end|Unexpected token/.test(String(e))
+          if (!transport) transportOnly = false
+          log(`LLM/解析失败（第 ${attempt} 次，${transport ? '传输层故障' : cut ? '疑似截断' : '格式错误'}）${bvid}${tag}: ${String(e).slice(0, 160)}`)
+          if (attempt === 3) break
+          if (transport) {
+            const waitMs = [5000, 20000][Math.min(attempt - 1, 1)]
+            log(`上游不可用，等待 ${Math.round(waitMs / 1000)}s 后重试（${bvid}${tag}）`)
+            await backoffSleep(waitMs)
+          } else if (cut && chunk.length > 2500 && attempt === 2) {
+            // 截断的真正原因是「一片里要吐的补丁太多」，不是 maxTokens 不够。
+            // 把这一个片对半劈开插回队首，两半各自只需一半输出。
+            const mid = Math.floor(chunk.length / 2)
+            const cutAt = chunk.lastIndexOf('\n', mid) > 0 ? chunk.lastIndexOf('\n', mid) : mid
+            chunks.splice(ci + 1, 0, chunk.slice(0, cutAt), chunk.slice(cutAt))
+            log(`输出被截断，切片对半重试（${bvid}${tag} ${chunk.length}→${cutAt}+${chunk.length - cutAt} 字）`)
+            split = true
+            break
+          } else if (cut) maxTokens = Math.min(maxTokens * 2, 64000)
         }
-      } catch (e) {
-        const cut = /未找到 JSON 对象|Unterminated|Unexpected end|Unexpected token/.test(String(e))
-        log(`LLM/解析失败（第 ${attempt} 次，${cut ? '疑似截断' : '格式错误'}）${bvid}: ${String(e).slice(0, 160)}`)
-        if (attempt === 3) return 'no_patch'
-        // 截断 → 下一次给双倍预算（最多 64000）；格式错误则保持不变
-        if (cut) maxTokens = Math.min(maxTokens * 2, 64000)
+      }
+      if (split) continue
+      if (part === null) { failedChunks += 1; continue }
+      for (const p of part) {
+        const key = `${String(p.find)}\u0000${String(p.replace)}`
+        if (seen.has(key)) continue
+        if (!body.includes(String(p.find))) continue
+        seen.add(key)
+        all.push(p)
       }
     }
-    if (patches === null) return 'no_patch'
+    const patches: Array<Record<string, unknown>> | null = failedChunks === chunks.length ? null : all
+    const parsed = parsedLen > 0 ? `~${parsedLen}` : null
+    if (patches === null) return transportOnly ? 'unavailable' : 'no_patch'
     normalizeDigitKinds(patches, bvid)
     if (patches.length === 0) return 'empty'
     try {
@@ -1185,7 +1268,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   // ─────────────────────────────────────────────────────── 错字通道（error）
-  async function runErrorBatch(opts: { size: number; batch?: number; dryRun: boolean }): Promise<Record<string, unknown>> {
+  async function runErrorBatch(opts: { size: number; batch?: number; dryRun: boolean; only?: string; applyOnly?: boolean; redo?: boolean }): Promise<Record<string, unknown>> {
     const state = readJson<Record<string, any>>(ledgerPath(), {})
     const batches = (state.batches as Record<string, any>) || {}
     let maxN = 0
@@ -1201,13 +1284,29 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     } catch { /* P().state 不可读 */ }
     const batchNo = Number.isFinite(opts.batch as number) ? Number(opts.batch) : maxN + 1
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'queue', startedAt: nowIso() }
-    const q = run(P().python, [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)], { cwd: SCRIPT_CWD, timeoutMs: 300000 })
+    // 复用上一轮 dryRun 的补丁直接落地：省掉整轮 LLM（4 篇 ≈ 34 次调用 / 近 1 小时）。
+    if (opts.applyOnly) return await runApplyOnlyError(batchNo)
+
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'queue', startedAt: nowIso() }
+    const qArgs = [BATCH_SCRIPT, 'queue', '--batch', String(batchNo), '--n', String(opts.size)]
+    if (opts.only) qArgs.push('--only', String(opts.only))
+    // 精修：把这几篇从「已完成」里捞回来重跑（queue 的 --redo 收的是稿件 id 列表）
+    if (opts.redo && opts.only) qArgs.push('--redo', String(opts.only))
+    const q = run(P().python, qArgs, { cwd: SCRIPT_CWD, timeoutMs: 300000 })
     if (q.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'error', phase: 'queue', error: `queue rc=${q.rc}`, tail: tail(q.out) }
     }
     const qf = join(P().state, `queue-batch-${batchNo}.json`)
     const queue = readJson<Array<{ bvid: string }>>(qf, [])
+    if (queue.length === 0) {
+      // 空队最容易误会成"跑完了"：把 python 侧的原因（已完成/被在飞批次占用/only 没匹配）
+      // 原样带回去，并且不跑 apply/record（没有任何改动）。
+      return {
+        ok: true, status: 'EMPTY', batch: batchNo, kind: 'error', queued: 0, dryRun: opts.dryRun,
+        note: tail(q.out) || '队列为空',
+        hint: '排查：① only 是否真的匹配到稿件；② 是否有中断批次把稿子挂在「在飞」（超过 6 小时会自动释放，可用 DSH_CORPUS_STALE_HOURS 调）；③ 台账里这些稿子是否已 done（要重跑用 redo/--force）。',
+      }
+    }
     // 旧主库已退役：清洗脚本按「落点 + 存档」两副本工作，缺的从存档补进落点。
     const hyd = hydrateDocs(queue.map((x) => String(x.bvid)))
     if (hyd.copied > 0) log(`批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
@@ -1218,17 +1317,31 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
     // 逐篇串行（1 篇 1 次 LLM 调用）；单篇失败只记 no_patch，不炸整批
     let patched = 0; let empty = 0; let noPatch = 0
+    const llmSkipped: string[] = []
     const t0 = Date.now()
     for (const item of queue) {
       const bvid = String(item.bvid)
-      inFlight = { kind: 'error', batch: batchNo, phase: `llm ${patched + empty + noPatch + 1}/${queue.length} ${bvid}`, startedAt: nowIso() }
+      inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: `llm ${patched + empty + noPatch + 1}/${queue.length} ${bvid}`, startedAt: nowIso() }
       const r = await processDoc(batchNo, bvid)
       if (r === 'patched') patched += 1
       else if (r === 'empty') empty += 1
+      // 上下文失效/上游抖动常常只打中某一篇：不要整批 break（实测 2026-11-12 批 11
+      // 018/019/020 全灭但 021 正常）。跳过这一篇继续跑完，最后把没跑成的列出来。
+      else if (r === 'unavailable') llmSkipped.push(bvid)
       else noPatch += 1
     }
+    const llmDown = llmSkipped.length > 0
+    // 上游整段不可用：不 record（这篇没跑过），本批直接判 UNKNOWN，等恢复了重跑同一批号。
+    if (llmDown && patched === 0 && empty === 0) {
+      inFlight = null
+      return {
+        ok: false, status: 'LLM_UNAVAILABLE', batch: batchNo, kind: 'error', queued: queue.length,
+        docsWithPatches: 0, unavailableDocs: llmSkipped,
+        hint: '上游模型服务不可用（503/连接超时），本批未落地、未记账；恢复后用同一批号重跑即可（batch 指定该号）。',
+      }
+    }
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'verify', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'verify', startedAt: nowIso() }
     const ver = run(P().python, [BATCH_SCRIPT, 'verify', '--batch', String(batchNo)], { cwd: SCRIPT_CWD, timeoutMs: 900000 })
     if (ver.rc !== 0) {
       return {
@@ -1238,7 +1351,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       }
     }
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'apply', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const patchDir = join(patchRoot(), `batch-${batchNo}`)
     const reportFile = join(P().state, `report-batch-${batchNo}.json`)
     const applyArgs = [
@@ -1262,7 +1375,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       }
     }
 
-    inFlight = { kind: 'error', batch: batchNo, phase: 'gates', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'gates', startedAt: nowIso() }
     const gate = runGates()
     const result: Record<string, unknown> = {
       ok: Boolean(gate.pass),
@@ -1280,11 +1393,64 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       patches: report.total_patches ?? null,
       dropped: report.total_dropped ?? null,
       applied: Array.isArray(report.reports) ? report.reports.filter((r: any) => r && r.ok).length : null,
+      unavailableDocs: llmSkipped,
       gate: {
         lintRc: (gate.lint as any).rc, lintPass: (gate.lint as any).pass,
         selftestPass: (gate.selftest as any).pass, pass: gate.pass,
       },
       tokens: { input: tokens.input, output: tokens.output, calls: tokens.calls },
+      elapsedMs: Date.now() - t0,
+      at: nowIso(),
+      nextBatchAllowed: gate.pass,
+    }
+    lastBatch = result
+    return result
+  }
+
+  /** 复用上一轮 dryRun 产出的补丁，直接 apply → record → 门禁（不再调 LLM）。 */
+  async function runApplyOnlyError(batchNo: number): Promise<Record<string, unknown>> {
+    const pd = join(patchRoot(), `batch-${batchNo}`)
+    const snapFile = join(P().state, `snap-batch-${batchNo}.json`)
+    const qf = join(P().state, `queue-batch-${batchNo}.json`)
+    if (!existsSync(pd) || !existsSync(snapFile) || !existsSync(qf)) {
+      return {
+        ok: false, error: 'NO_PATCHES', batch: batchNo, kind: 'error',
+        message: `批 ${batchNo} 缺少可复用件（patchDir=${existsSync(pd)} snap=${existsSync(snapFile)} queue=${existsSync(qf)}）——先跑 dryRun=true 产出补丁，再 applyOnly=true 落地`,
+      }
+    }
+    const queue = readJson<Array<{ bvid: string }>>(qf, [])
+    const t0 = Date.now()
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'apply(reuse)', startedAt: nowIso() }
+    const reportFile = join(P().state, `report-batch-${batchNo}.json`)
+    const ap = run(P().python, [
+      APPLY_SCRIPT, '--dir', pd, '--snap', snapFile, '--report', reportFile, '--drop-bad',
+    ], { cwd: SCRIPT_CWD, timeoutMs: 900000 })
+    if (ap.rc !== 0) {
+      return { ok: false, batch: batchNo, kind: 'error', phase: 'apply', status: 'FAILED', error: `apply rc=${ap.rc}`, tail: tail(ap.out) }
+    }
+    const report = readJson<Record<string, any>>(reportFile, {})
+    const rec = run(P().python, [BATCH_SCRIPT, 'record', '--batch', String(batchNo)], { cwd: SCRIPT_CWD, timeoutMs: 300000 })
+    if (rec.rc !== 0) {
+      return { ok: false, batch: batchNo, kind: 'error', phase: 'record', status: 'FAILED', error: `record rc=${rec.rc}`, tail: tail(rec.out) }
+    }
+    inFlight = { corpus: ACTIVE_ID, kind: 'error', batch: batchNo, phase: 'gates', startedAt: nowIso() }
+    const gate = runGates()
+    const result: Record<string, unknown> = {
+      ok: Boolean(gate.pass),
+      status: gate.pass ? 'DONE' : 'FAILED',
+      batch: batchNo,
+      kind: 'error',
+      applyOnly: true,
+      dryRun: false,
+      queued: queue.length,
+      patches: report.total_patches ?? null,
+      dropped: report.total_dropped ?? null,
+      applied: Array.isArray(report.reports) ? report.reports.filter((r: any) => r && r.ok).length : null,
+      gate: {
+        lintRc: (gate.lint as any).rc, lintPass: (gate.lint as any).pass,
+        selftestPass: (gate.selftest as any).pass, pass: gate.pass,
+      },
+      tokens: { input: 0, output: 0, calls: 0 },
       elapsedMs: Date.now() - t0,
       at: nowIso(),
       nextBatchAllowed: gate.pass,
@@ -1323,7 +1489,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     // 同上：标点脚本也按两副本工作，先把存档里的稿补进落点。
     const hyd = hydrateDocs(queue.map((x) => String(x.bvid)))
     if (hyd.copied > 0) log(`punct 批次 ${batchNo}：从存档补齐 ${hyd.copied} 篇到落点`)
-    inFlight = { kind: 'punct', batch: batchNo, phase: 'local-model', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'punct', batch: batchNo, phase: 'local-model', startedAt: nowIso() }
     const local = run(P().pythonAsr, [PUNCT_LOCAL, '--batch', String(batchNo)], {
       cwd: SCRIPT_CWD,
       timeoutMs: Number(E.DSH_CORPUS_PUNCT_TIMEOUT_MS || 4 * 3600 * 1000),
@@ -1331,7 +1497,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     if (local.rc !== 0) {
       return { ok: false, batch: batchNo, kind: 'punct', phase: 'local', status: 'FAILED', error: `punct_local rc=${local.rc}`, tail: tail(local.out) }
     }
-    inFlight = { kind: 'punct', batch: batchNo, phase: 'apply', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'punct', batch: batchNo, phase: 'apply', startedAt: nowIso() }
     const applyArgs = [PUNCT_APPLY, '--batch', String(batchNo)]
     if (opts.dryRun) applyArgs.push('--dry-run')
     const ap = run(P().python, applyArgs, { cwd: SCRIPT_CWD, timeoutMs: 1800000 })
@@ -1341,7 +1507,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     const report = readJson<Array<Record<string, any>>>(join(P().state, `report-punct-${batchNo}.json`), [])
     const landed = report.filter((r) => r && r.ok).length
     const rejected = report.filter((r) => r && !r.ok).length
-    inFlight = { kind: 'punct', batch: batchNo, phase: 'gates', startedAt: nowIso() }
+    inFlight = { corpus: ACTIVE_ID, kind: 'punct', batch: batchNo, phase: 'gates', startedAt: nowIso() }
     const gate = runGates()
     const result: Record<string, unknown> = {
       ok: Boolean(gate.pass),
@@ -1366,8 +1532,8 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   }
 
   /** 批次互斥 + 门禁闸门 + 暂停闸门。 */
-  async function runBatch(kind: string, opts: { size?: number; batch?: number; dryRun?: boolean; corpus?: string }): Promise<Record<string, unknown>> {
-    if (inFlight) return { ok: false, error: 'BUSY', detail: inFlight, message: '同一时刻只允许一个批次在跑' }
+  async function runBatch(kind: string, opts: { size?: number; batch?: number; dryRun?: boolean; corpus?: string; only?: string; applyOnly?: boolean; redo?: boolean }): Promise<Record<string, unknown>> {
+    if (inFlight) return { ok: false, error: 'BUSY', detail: inFlight, message: `同一时刻只允许一个批次在跑（持有者语料 ${inFlight.corpus || '?'}）` }
     if (isPaused()) return { ok: false, error: 'PAUSED', message: '驾驶舱已暂停（corpus_paused.flag 存在）——先 corpus_resume' }
     if (gateBlocked) {
       return {
@@ -1380,7 +1546,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
     if (opts.corpus) ACTIVE_ID = profileOf(opts.corpus).id
     try {
       if (kind === 'punct') return await runPunctBatch({ batch: opts.batch, dryRun: Boolean(opts.dryRun) })
-      return await runErrorBatch({ size: Number(opts.size) || 24, batch: opts.batch, dryRun: Boolean(opts.dryRun) })
+      return await runErrorBatch({ size: Number(opts.size) || 24, batch: opts.batch, dryRun: Boolean(opts.dryRun), only: opts.only, applyOnly: opts.applyOnly === true, redo: opts.redo === true })
     } catch (e) {
       log(`批次异常: ${String(e)}`)
       return { ok: false, error: 'EXCEPTION', message: String(e), status: 'FAILED' }
@@ -2185,6 +2351,10 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         size: { type: 'integer', description: '错字通道本批篇数（默认 24）' },
         batch: { type: 'integer', description: '指定批号/波号（缺省自动取下一个）' },
         dryRun: { type: 'boolean', description: 'true=只预览不落地（LLM 与补丁照常产出）' },
+        only: { type: 'string', description: '只处理这些稿件（逗号分隔，匹配稿件 id 或标题子串）。默认队列按日期倒序取最新，想点名单篇试跑才用它' },
+        corpus: { type: 'string', description: '在哪个语料上跑（缺省=当前生效语料，用 corpus_use 切换）。给了就只对本次调用生效，不改全局' },
+        applyOnly: { type: 'boolean', description: 'true=复用上一轮 dryRun 已产出的补丁直接落地（apply→record→门禁），不重跑 LLM。必须配 batch 指定批号' },
+        redo: { type: 'boolean', description: 'true=把 only 点名的稿件从「已完成」里捞回来重跑（同一篇再跑一遍能补上首轮漏掉的错字）。必须配 only' },
       },
       required: ['kind'],
     },
@@ -2198,6 +2368,10 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
         size: args?.size === undefined ? undefined : Number(args.size),
         batch: args?.batch === undefined ? undefined : Number(args.batch),
         dryRun: args?.dryRun === true,
+        only: args?.only === undefined ? undefined : String(args.only),
+        corpus: args?.corpus === undefined ? undefined : String(args.corpus),
+        applyOnly: args?.applyOnly === true,
+        redo: args?.redo === true,
       })
       return JSON.stringify(res, null, 2)
     },

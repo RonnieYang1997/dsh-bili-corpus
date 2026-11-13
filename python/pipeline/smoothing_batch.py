@@ -12,7 +12,7 @@
 台账：BASE_DIR/_smoothing_state/ledger.json（语料根之外，R28）
 补丁：<STATE>/_patches/batch-<N>/<bvid>.json（子代理唯一允许写的位置）
 """
-import sys, os, re, json, argparse, hashlib, subprocess, datetime, shutil
+import sys, os, re, json, argparse, hashlib, subprocess, datetime, shutil, time
 import paths as _cp
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -99,28 +99,63 @@ def cmd_queue(a):
     # 在飞批次（已排队但还没 record）的稿子要跳过：否则会把同一个稿子重复排进下一批。
     # 注意只跳"在飞"的，已 record 批次里那些没拿到补丁的失败稿子仍会被重新排队（这正是想要的重试）。
     inflight = set()
+    stale_h = float(os.environ.get("DSH_CORPUS_STALE_HOURS", "6") or 6)
     for k, b in led["batches"].items():
-        if not b.get("recorded_at"):
-            inflight.update(b.get("queued") or [])
+        if b.get("recorded_at"):
+            continue
+        qf_k = os.path.join(STATE, "queue-batch-%s.json" % k)
+        try:
+            age_h = (time.time() - os.path.getmtime(qf_k)) / 3600.0
+        except OSError:
+            age_h = 0.0
+        # 崩掉/被中断的批次会在台账里留一条没有 recorded_at 的「在飞」记录，
+        # 它排过的稿件会被永久跳过（→ queued:0 且毫无提示）。超过 stale_h 小时就当它死了。
+        if stale_h > 0 and age_h > stale_h:
+            print("在飞批次 %s 已挂 %.1f 小时（阈值 %.1f），自动释放其稿件：%s"
+                  % (k, age_h, stale_h, ",".join(b.get("queued") or [])[:160]))
+            continue
+        inflight.update(b.get("queued") or [])
+    # --redo 收的是逗号分隔的稿子标识，但实际 id 是「009 商品的人格化…」这种整串，
+    # 所以按前缀/子串匹配（精确比对会让 redo 永远落空，实测 2026-11-12）。
+    _redo_raw = (getattr(a, "redo", None) or "").strip()
+    _redo_pats = [p.strip() for p in _redo_raw.split(",") if p.strip()]
+
+    def _is_redo(bvid):
+        return any(p == bvid or bvid.startswith(p) or p in bvid for p in _redo_pats)
+
+    n_done = 0
+    n_inflight = 0
     for f in sorted(_cp.iter_names()):
         if not _cp.is_doc(f):
             continue
         bvid = _cp.stem(f)
         if bvid in inflight:
+            n_inflight += 1
             continue
-        if led["docs"].get(bvid, {}).get("status") in DONE_STATUS and bvid not in (
-                a.redo.split(",") if a.redo else []):
+        if led["docs"].get(bvid, {}).get("status") in DONE_STATUS and not _is_redo(bvid):
+            n_done += 1
             continue
         meta = doc_meta(f)
         if meta is None:
             pending.add(bvid)
             continue
         todo.append({"bvid": bvid, "date": meta["date"], "title": meta["title"]})
+    if not todo:
+        print("队列为空：已完成 %d 篇、被在飞批次占用 %d 篇、frontmatter 异常 %d 篇"
+              % (n_done, n_inflight, len(pending)))
     todo.sort(key=lambda x: (x["date"], x["bvid"]), reverse=True)
     print("全库 %d 篇待处理（另有 %d 篇 frontmatter 异常未入队）" % (len(todo), len(pending)))
     if a.date_from:
         todo = [x for x in todo if x["date"] >= a.date_from]
         print("按日期下限 %s 过滤后 %d 篇" % (a.date_from, len(todo)))
+    # 指定稿件（逗号分隔，按 id/标题子串匹配）——用来单篇试跑，默认队列是
+    # 「按日期倒序取最新」，想点名单篇只能靠它。
+    only = (getattr(a, "only", None) or "").strip()
+    if only:
+        pats = [p.strip() for p in only.split(",") if p.strip()]
+        todo = [x for x in todo
+                if any(p in str(x["bvid"]) or p in str(x.get("title") or "") for p in pats)]
+        print("按 --only=%s 过滤后 %d 篇" % (only, len(todo)))
     batch = todo[:a.n]
     pd = batch_dir(a.batch)
     os.makedirs(pd, exist_ok=True)
@@ -275,6 +310,7 @@ def main():
     p = sub.add_parser("queue"); p.add_argument("--n", type=int, default=30)
     p.add_argument("--batch", type=int, required=True)
     p.add_argument("--date-from"); p.add_argument("--redo")
+    p.add_argument("--only", help="只处理匹配这些子串的稿（逗号分隔，匹配稿件 id 或标题）")
     p.add_argument("--force", action="store_true", help="允许复用已 record 的批号（会覆盖历史记录）")
     p.set_defaults(func=cmd_queue)
     for name, fn in (("snapshot", cmd_snapshot), ("verify", cmd_verify), ("apply", cmd_apply),
