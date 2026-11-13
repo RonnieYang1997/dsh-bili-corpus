@@ -1317,7 +1317,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
 
     // 逐篇串行（1 篇 1 次 LLM 调用）；单篇失败只记 no_patch，不炸整批
     let patched = 0; let empty = 0; let noPatch = 0
-    let llmDown = false
+    const llmSkipped: string[] = []
     const t0 = Date.now()
     for (const item of queue) {
       const bvid = String(item.bvid)
@@ -1325,15 +1325,18 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       const r = await processDoc(batchNo, bvid)
       if (r === 'patched') patched += 1
       else if (r === 'empty') empty += 1
-      else if (r === 'unavailable') { llmDown = true; break }
+      // 上下文失效/上游抖动常常只打中某一篇：不要整批 break（实测 2026-11-12 批 11
+      // 018/019/020 全灭但 021 正常）。跳过这一篇继续跑完，最后把没跑成的列出来。
+      else if (r === 'unavailable') llmSkipped.push(bvid)
       else noPatch += 1
     }
+    const llmDown = llmSkipped.length > 0
     // 上游整段不可用：不 record（这篇没跑过），本批直接判 UNKNOWN，等恢复了重跑同一批号。
     if (llmDown && patched === 0 && empty === 0) {
       inFlight = null
       return {
         ok: false, status: 'LLM_UNAVAILABLE', batch: batchNo, kind: 'error', queued: queue.length,
-        docsWithPatches: 0,
+        docsWithPatches: 0, unavailableDocs: llmSkipped,
         hint: '上游模型服务不可用（503/连接超时），本批未落地、未记账；恢复后用同一批号重跑即可（batch 指定该号）。',
       }
     }
@@ -1390,6 +1393,7 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
       patches: report.total_patches ?? null,
       dropped: report.total_dropped ?? null,
       applied: Array.isArray(report.reports) ? report.reports.filter((r: any) => r && r.ok).length : null,
+      unavailableDocs: llmSkipped,
       gate: {
         lintRc: (gate.lint as any).rc, lintPass: (gate.lint as any).pass,
         selftestPass: (gate.selftest as any).pass, pass: gate.pass,
