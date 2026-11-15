@@ -70,6 +70,10 @@ def cookie_candidates(explicit_file=None):
         out.append(env_file)
     out.append(os.path.join(os.getcwd(), "cookies.txt"))
     out.append(os.path.join(skill_root, "cookies.txt"))
+    # 2026-11-14：DSH 侧统一放 cookie 的位置（插件 bridge / 旧 _scratch 脚本都写这里）。
+    # 之前这里只认 store_path()=%%APPDATA%%ilibili-transcribe\cookies.txt，
+    # 而用户把新 cookie 贴进 ~/.dsh/bili-cookie.txt，导致引擎一直用旧文件。
+    out.append(os.path.join(os.path.expanduser("~"), ".dsh", "bili-cookie.txt"))
     out.append(store_path())
     return out
 
