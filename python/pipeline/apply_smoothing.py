@@ -29,6 +29,7 @@ kind 取值：homophone | name | punct | stutter | number | other
 """
 import sys, os, re, json, hashlib, shutil, argparse, datetime, difflib
 import paths as _cp
+import fillers as _fill
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -38,6 +39,8 @@ MIRROR = _cp.MIRROR
 ARCHIVE = _cp.ASR_RAW           # 语料根之外（R28）
 FM_RE = re.compile(r"^---\r?\n.*?\r?\n---\r?\n", re.S)
 KINDS = {"homophone", "name", "punct", "stutter", "number", "other"}
+# 口语碎屑收尾（R46）：补丁落完之后统一清一次 呃/嗯/啊/哈哈哈，默认开。
+FILLERS_ON = True
 # 正文里出现这些行首表头就是 R1/R3 的违背（中文标签不许进正文）
 LABEL_RE = re.compile(r"^(标题|日期|时长|BVID|简介|正文|来源)[:：]")
 
@@ -298,7 +301,17 @@ def apply_one(bvid, spec, dry_run, drop_bad=False, snap=None, allow_name_digits=
             new_body = new_body.replace(f, r)
         res["applied"].append({"kind": kind, "find": f, "replace": r, "why": p.get("why", "")})
 
-    if not res["applied"]:
+    # ---- 口语碎屑收尾（R46）----
+    # 放在校验之前、写盘之前：删完 呃/啊 会留下  这种残渣，必须一起收敛，
+    # 否则这些残渣就成了"新引入的错"。
+    fill_stats = {}
+    if FILLERS_ON:
+        cleaned, fill_stats = _fill.clean_body(new_body)
+        new_body = cleaned
+        if fill_stats:
+            res["fillers"] = fill_stats
+
+    if not res["applied"] and not fill_stats:
         # 全部"冗余"= 这些补丁的内容已经在正文里了（先前被应用过，或本来就对）。
         # 这不是失败，是"无事可做"，要如实记成 already，别记成 skip（skip 会让人以为改坏了）。
         if res.get("redundant"):
@@ -403,11 +416,15 @@ def main():
     ap_.add_argument("--allow-name-digits", action="store_true",
                      help="放行 kind=name 且数字凭空出现/消失的专名修正（默认关闭，"
                           "需用户点头：常见时→长剑10 这类）")
+    ap_.add_argument("--no-fillers", action="store_true",
+                     help="不清口语碎屑（呃/嗯/啊/哈哈哈）。默认清，见 R46")
     ap_.add_argument("--allow-name-digits-strong", action="store_true",
                      help="更强放行（仅回收复核用）：kind=name 且补丁 why ≥12 字时，"
                           "连两侧都带数字的型号修正也放行（110坦克→100坦克、457→苏-57、"
                           "8192→81192）。默认关闭；主通道不开。")
     args = ap_.parse_args()
+    global FILLERS_ON
+    FILLERS_ON = not args.no_fillers
     snap = json.load(open(args.snap, encoding="utf-8-sig")) if args.snap else None
 
     if args.dir:

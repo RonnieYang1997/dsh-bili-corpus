@@ -48,7 +48,7 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 旧的 `dsh-corpus-cockpit` 已卸载：本插件用同名 `corpus_*` 工具接管，状态/台账路径不变，
 因此 180 批历史与门禁状态都继承下来。
 
-## 工具（13 个）
+## 工具（14 个）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -63,6 +63,8 @@ dev_inject_plugin C:\Users\Ronnie\Documents\GitHub\dsh-bili-corpus
 | `corpus_use {id?}` | 不带 id = 列出全部语料与当前生效语料；带 id = 切换（写 `~/.dsh/corpus/active-corpus.json`，重载插件后保持）。批次/转写在跑时拒绝。 |
 | `corpus_manage {action, id, naming?, landing?, archive?, state?, docPrefix?, docPattern?, indexFile?, confirm?}` | 新建 / 编辑 / 删除语料（写 `corpora.json` 并建目录）。`naming` 可为 `bvid` / `title` / `plain`；`plain` 必须给 `docPattern`（正则认稿，如 `^[0-9]{3} .+\.md$`）。`action=delete` 必须 `confirm:true`；删除只删配置、目录保留；内置语料、生效语料、目录里还有带 BV 号稿件的语料都会被拒。批次/转写在跑时 BUSY。 |
 | `corpus_dict {action, rules?, dryRun?, only?, sample?, force?, strictMiss?, merge?}` | **确定性词典通道（0 token）**：喂 TSV 规则表（`键\t值\t依据`）批量修稿，长键优先、跑到不动点（cap 8 遍）。`check` 体检（重复键 / 自食 / 单字键 / 零命中）、`verify` 只统计能改多少处、`apply` 落地（先备份到 `<STATE>/_dict_backup/<时间戳>/`，**默认 dryRun=true**）。`rules` 可给逗号分隔的文件或**目录**（跨讲累积表一起喂要 `merge:true`，重复键先到先得）。 |
+
+| `corpus_fillers {action, dryRun?, only?, sample?}` | **口语碎屑清理（0 token，确定性）**：删「不是话的字」——`呃/嗯/哦/噢/唉/哎/诶/呀/啊` 见到即删；保护词（哈佛/哈尔滨/哈耶克/哈贝马斯/哈勃/哈利波特/哈尔…）之外剩余的任何「哈」一律删（`哈哈哈`、`问题哈，`、句中单字）；独立的「额」删（`定额/额度` 不动）；顺带收敛残渣（`，。`→`。`、段首标点、引号前后逗号）。`action=stats` 只统计，`apply` 默认 `dryRun=true` 只预览。`apply_smoothing.py` 落地时**默认已自动跑一遍**（R46，`--no-fillers` 可关）。 |
 
 ## HTTP 端点
 

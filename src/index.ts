@@ -2311,6 +2311,36 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
   })
 
   register({
+    name: 'corpus_fillers',
+    description: '口语碎屑清理（0 token、确定性、可复算）：删「不是话的字」——呃/嗯/哦/噢/唉/哎/诶/呀/啊（见到即删）、与标点相邻或成串的「哈」（哈哈哈、问题哈，）、独立出现的「额」（定额/额度这类不动），并收敛删除后留下的标点残渣（，。→。、段首标点、引号前后逗号）。保护词白名单（哈佛/哈尔滨/哈耶克/哈哈镜…）不会被误删。apply_smoothing.py 落地时默认已自动跑一遍（R46），本工具用于单独补跑或预览。action=stats 只统计；apply 默认 dryRun=true 只预览。返回 JSON。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['stats', 'apply'], description: 'stats=只统计会删多少；apply=真落地（默认预览）' },
+        dryRun: { type: 'boolean', description: 'apply 时缺省 true（只预览不写）' },
+        only: { type: 'string', description: '只处理文件名含该子串的稿件（如「沃格林」）' },
+        sample: { type: 'integer', description: '明细展示篇数（默认 20）' },
+      },
+      required: ['action'],
+    },
+    output: textOutput,
+    async execute(args: Record<string, any>) {
+      const action = String(args?.action ?? 'stats').trim()
+      if (!['stats', 'apply'].includes(action)) {
+        return JSON.stringify({ ok: false, error: 'BAD_ARGS', message: 'action 必须是 stats / apply' }, null, 2)
+      }
+      const argv = ['fillers.py', action === 'apply' ? '--apply' : '--stats']
+      if (action === 'apply' && args?.dryRun !== false) argv.push('--dry-run')
+      if (args?.only) argv.push('--only', String(args.only))
+      if (args?.sample !== undefined) argv.push('--sample', String(Number(args.sample)))
+      const r = run(P().python, argv, { cwd: PIPELINE, timeoutMs: 1800000 })
+      const ok = r.rc === 0
+      log(`fillers ${action} rc=${r.rc}`)
+      return JSON.stringify({ ok, at: nowIso(), corpus: P().id, action, rc: r.rc, ms: r.ms, error: r.error, out: r.out.slice(-20000) }, null, 2)
+    },
+  })
+
+  register({
     name: 'corpus_pause',
     description: '暂停驾驶舱（写 _smoothing_state/cockpit-paused.flag）：暂停后 corpus_batch 与守护循环都拒绝开批。返回 JSON。',
     parameters: { type: 'object', properties: { reason: { type: 'string', description: '暂停原因（写进 flag 文件）' } } },
