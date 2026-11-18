@@ -39,6 +39,35 @@ MIRROR = _cp.MIRROR
 ARCHIVE = _cp.ASR_RAW           # 语料根之外（R28）
 FM_RE = re.compile(r"^---\r?\n.*?\r?\n---\r?\n", re.S)
 KINDS = {"homophone", "name", "punct", "stutter", "number", "other"}
+
+# 全角标点 -> 半角（1:1 字符映射，长度不变，所以归一化后下标与原文一一对应）。
+# 用途：讲座稿正文是全角标点，而补丁 find 里若带半角逗号（或反之）原文永不命中；
+# 归一化比较可以救回来，替换时仍按原文切片，不改变任何标点。
+_FW2HW = str.maketrans({
+    "，": ",", "。": ".", "？": "?", "！": "!", "；": ";",
+    "：": ":", "、": ",", "（": "(", "）": ")", "“": '"', "”": '"',
+    "‘": "'", "’": "'", "《": "<", "》": ">",
+})
+
+
+def _norm_punct(s):
+    return s.translate(_FW2HW)
+
+
+def _norm_positions(body, f):
+    """find 字面没命中时，按「全角/半角无关」比较再找一次；返回原文下标列表。"""
+    n = len(f)
+    if n == 0 or len(body) < n:
+        return []
+    fn = _norm_punct(f)
+    if fn == f:
+        return []
+    bn = _norm_punct(body)
+    out, i = [], bn.find(fn)
+    while i >= 0:
+        out.append(i)
+        i = bn.find(fn, i + 1)
+    return out
 # 口语碎屑收尾（R46）：补丁落完之后统一清一次 呃/嗯/啊/哈哈哈，默认开。
 FILLERS_ON = True
 # 正文里出现这些行首表头就是 R1/R3 的违背（中文标签不许进正文）
@@ -282,6 +311,29 @@ def apply_one(bvid, spec, dry_run, drop_bad=False, snap=None, allow_name_digits=
             # 已经被别的补丁改掉了？只要改后文本已出现，就算"冗余"而非"坏补丁"
             if r and r in new_body:
                 res["redundant"].append({"find": f[:40], "replace": r[:40]})
+                continue
+            # 全角/半角标点差异的兜底：正文是全角、find 写半角（或反之）时字面永不命中。
+            # 归一化比较长度不变，可直接按原文下标切片替换，标点一个都不动。
+            npos = _norm_positions(new_body, f)
+            if npos:
+                if len(npos) > 1 and occ is None and not p.get("all"):
+                    if reject("find 有 %d 处「全角/半角等价」命中且未指定 occurrence/all: %r"
+                              % (len(npos), f[:40]), p):
+                        return res
+                    continue
+                if occ is not None:
+                    if occ < 1 or occ > len(npos):
+                        if reject("occurrence=%s 越界（全角容错匹配 %d 处）: %r"
+                                  % (occ, len(npos), f[:40]), p):
+                            return res
+                        continue
+                    targets = [npos[occ - 1]]
+                else:
+                    targets = list(npos)
+                for t in sorted(targets, reverse=True):
+                    new_body = new_body[:t] + r + new_body[t + len(f):]
+                res["applied"].append({"kind": kind, "find": f, "replace": r,
+                                      "why": p.get("why", ""), "fw_tolerant": True})
                 continue
             if reject("find 不存在: %r" % f[:40], p):
                 return res

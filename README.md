@@ -339,6 +339,15 @@ python python/pipeline/dict_apply.py --selftest
    多传 `--guard` 会 argparse 报 `unrecognized arguments`（2026-10-31 演示批实测，已从宿主调用里去掉）。
 9. **清洗脚本的常量是"旧世界"口径**：`smoothing_batch.py` 里 `STATE = _cp.STATE` 之类必须在 env 里
    给全（`DSH_CORPUS_STATE/PATCHES`），否则会退回 dufuzhixin 的默认路径 → 串库写入。
+10. **批次顺序固定**：`queue → snapshot → 写补丁 → patch_lint → apply --guard → record`。
+    反着来会空跑并记假账（批 4：补丁先写、queue 后跑，目录被清空，`apply` 报空目录，
+    `record` 却用 dry-run 报告的字数/sha 把稿子记成 done）。现已有守卫：queue 备份旧补丁到
+    `_patches/_stale/`、apply 空目录直接报错并打印顺序、record 拒绝 dry-run 报告并逐篇核对磁盘 sha。
+11. **补丁形状有三条硬规则**：非 stutter 的 kind 最多删 2 字；stutter 只许删 1~8 字 + 改 ≤2 字 +
+    只插标点；多命中要 `all`/`occurrence`。链式拆解必须「前一步 find 更长」（apply 按 find 长度降序执行）。
+    落地前先跑 `python/pipeline/patch_lint.py --doc <稿件> <补丁或 --dir 目录>`，它直接给改法。
+12. **find 与正文的全角/半角标点差异已兜底**：字面不命中时会做归一化比较再按原文下标切片替换
+    （`_norm_positions`，applied 里标 `fw_tolerant`）。讲座稿全角标点 + 补丁写半角逗号不再是死键。
 
 ## 冒烟
 

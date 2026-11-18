@@ -94,6 +94,17 @@ def cmd_queue(a):
     led = load_ledger()
     if not guard_batch_reuse(a, led):
         return 3
+    # 批 4 的教训：队列一跑，目录里已经写好的补丁就消失了，apply 空跑、record 还照记。
+    # 这里先备份到 _stale/，让"补丁是否还在"这件事永远可回溯。
+    pd = batch_dir(a.batch)
+    old_patches = [f for f in os.listdir(pd) if f.endswith(".json")] if os.path.isdir(pd) else []
+    if old_patches:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        dst = _cp.stale_dir(a.batch, stamp)
+        os.makedirs(dst, exist_ok=True)
+        for f in old_patches:
+            shutil.copy2(os.path.join(pd, f), os.path.join(dst, f))
+        print("注意：批 %d 的补丁目录里原有 %d 个文件，已备份到 %s" % (a.batch, len(old_patches), dst))
     todo = []
     pending = set()
     # 在飞批次（已排队但还没 record）的稿子要跳过：否则会把同一个稿子重复排进下一批。
@@ -224,6 +235,8 @@ def cmd_apply(a):
     files = [f for f in os.listdir(pd) if f.endswith(".json")]
     if not files:
         print("!! 补丁目录是空的: %s" % pd)
+        print("   正确顺序：queue --batch N → snapshot --batch N → 写补丁 → apply --guard → record")
+        print("   若补丁是 queue 之前写的，请先看 <STATE>/_patches/_stale/ 里有没有备份")
         return 1
     rep = os.path.join(STATE, "report-batch-%d.json" % a.batch)
     cmd = [sys.executable, APPLIER, "--dir", pd, "--drop-bad", "--report", rep]
@@ -243,11 +256,27 @@ def cmd_apply(a):
 
 
 def cmd_record(a):
-    rep = json.load(open(os.path.join(STATE, "report-batch-%d.json" % a.batch), "r", encoding="utf-8"))
+    rf = os.path.join(STATE, "report-batch-%d.json" % a.batch)
+    rep = json.load(open(rf, "r", encoding="utf-8"))
+    # 批 4 的教训：拿 dry-run 的报告 record，台账会记下"没写盘的字节数和 sha"，
+    # 从此台账与磁盘永久不一致，而且批次看上去"已完成"，没人会再查。
+    if rep.get("dry_run") and not getattr(a, "force", False):
+        print("!! 这份报告是 dry-run 的（没有写盘）：%s" % rf)
+        print("   请先跑 apply --batch %d（去掉 --dry-run）再 record；确实要记请加 --force" % a.batch)
+        return 1
     led = load_ledger()
     n_ok = n_skip = 0
+    mism = []
     for r in rep["reports"]:
         bvid = r["bvid"]
+        # 报告里的 sha_after 必须等于磁盘当前内容，否则这批次等于没落地（或被别人改过）。
+        try:
+            disk = sh(_cp.doc(bvid))
+        except OSError:
+            disk = None
+        want = r.get("sha_after")
+        if r["ok"] and disk and want and not disk.startswith(want):
+            mism.append((bvid, want, disk))
         if r["ok"]:
             st = "done" if r["patches"] else ("already" if r.get("redundant") else "empty")
             n_ok += 1
@@ -274,9 +303,15 @@ def cmd_record(a):
     upd = {"applied": n_ok, "skipped": n_skip, "dry_run": rep["dry_run"],
            "total_patches": rep["total_patches"], "total_dropped": rep.get("total_dropped", 0),
            "recorded_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    if mism:
+        print("!! 有 %d 篇的报告 sha 与磁盘不符，拒绝记账（说明这批没真正写盘）：" % len(mism))
+        for bvid, want, got in mism:
+            print("   %s  报告 %s / 磁盘 %s" % (bvid, want, got[:12]))
+        return 1
     if _cp.CORPUS_ID:
         upd["corpus"] = _cp.CORPUS_ID
-    led["batches"][str(a.batch)].update(upd)
+    # 用 setdefault：手工删过 ledger["batches"]["4"] 之后直接 update 会 KeyError（批 4 现场）
+    led["batches"].setdefault(str(a.batch), {}).update(upd)
     save_ledger(led)
     print("台账已更新：批 %d 记 %d 篇（跳过 %d）" % (a.batch, n_ok, n_skip))
     return 0
