@@ -50,6 +50,21 @@ _FW2HW = str.maketrans({
 })
 
 
+# 体例半角化：只转用户既定体例的五个标点（, ? ! ; :），句号/顿号/引号/书名号一律不动。
+# 与 calibrate.py 的机械层 FULL2HALF 保持完全一致。
+_HALF_STYLE = {"，": ",", "？": "?", "！": "!", "；": ";", "：": ":"}
+
+
+def _to_half_punct(body):
+    n = 0
+    for full, half in _HALF_STYLE.items():
+        c = body.count(full)
+        if c:
+            body = body.replace(full, half)
+            n += c
+    return body, n
+
+
 def _norm_punct(s):
     return s.translate(_FW2HW)
 
@@ -363,7 +378,14 @@ def apply_one(bvid, spec, dry_run, drop_bad=False, snap=None, allow_name_digits=
         if fill_stats:
             res["fillers"] = fill_stats
 
-    if not res["applied"] and not fill_stats:
+    # ---- 标点体例收尾（punct-style=half 的语料：capital 这类）----
+    punct_n = 0
+    if getattr(_cp, "PUNCT_STYLE", "full") == "half":
+        new_body, punct_n = _to_half_punct(new_body)
+        if punct_n:
+            res["punct_style"] = {"style": "half", "converted": punct_n}
+
+    if not res["applied"] and not fill_stats and not punct_n:
         # 全部"冗余"= 这些补丁的内容已经在正文里了（先前被应用过，或本来就对）。
         # 这不是失败，是"无事可做"，要如实记成 already，别记成 skip（skip 会让人以为改坏了）。
         if res.get("redundant"):

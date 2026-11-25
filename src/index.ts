@@ -812,7 +812,14 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
    */
   function archiveDoc(bvid: string, srcPath?: string, opts: { overwrite?: boolean } = {}): { archived: boolean; kept: boolean } {
     const src = srcPath || findDoc(bvid)
-    const fileName = src ? basename(src) : docNameFor(bvid)
+    // 找不到稿就别归档：plain/title 命名的稿子文件名里没有 BV 号，docmap 还没建立时
+    // findDoc 会返回 null；此时若退回 docNameFor(bvid)，会凭空造出 `dufu-<bvid>.md`
+    // 这种假名字写进 MEMORY.md 与 docmap，门禁立刻报「索引指向不存在的文件」。
+    if (!src) {
+      log(`归档跳过 ${bvid}：找不到稿件文件`)
+      return { archived: false, kept: false }
+    }
+    const fileName = basename(src)
     const dst = join(P().archive, fileName)
     // 同一 bvid 在存档里已有别的文件名的稿：说明换过命名策略，保留已有的，避免重复。
     const existingArchive = findDocIn(P().archive, bvid)
@@ -1771,7 +1778,11 @@ export function apply(ctx: PluginContext, _config?: Record<string, unknown>): vo
             } else if (msg.type === 'result') {
               if (msg.ok === true) {
                 // 落点在 P().landing（临时落脚）；真正的产物要归档进 git 仓 + 补索引。
-                const arch = msg.cached === true ? { archived: false, kept: false } : archiveDoc(job.bvid)
+                // 必须把引擎回报的 msg.path 传进去：plain/title 命名的稿子文件名不含 BV 号，
+                // 不传就 findDoc 找不到 → 归档失败 + 索引被写成假名（2026-11-25 案底）。
+                const arch = msg.cached === true
+                  ? { archived: false, kept: false }
+                  : archiveDoc(job.bvid, msg.path ? String(msg.path) : undefined)
                 const productPath = msg.path ? join(P().archive, basename(String(msg.path))) : ''
                 finish({
                   state: 'done', stage: 'done',

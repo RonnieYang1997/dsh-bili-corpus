@@ -55,6 +55,24 @@ if DOC_PATTERN:
         import sys as _sys
         print("**警告**：DSH_CORPUS_DOC_PATTERN 无效（%s），退回前缀规则" % _e, file=_sys.stderr)
         _DOC_RE = None
+# 标点体例：half = 正文里的 ，？！；： 一律转半角（用户既定体例 , ? ! ; :）；
+# full = 原样不动（讲座稿那种全角风格）。优先级：env > <STATE>/punct-style 文件 > full。
+def _punct_style():
+    v = (os.environ.get("DSH_CORPUS_PUNCT_STYLE") or "").strip().lower()
+    if v in ("half", "full"):
+        return v
+    try:
+        with open(os.path.join(STATE, "punct-style"), "r", encoding="utf-8") as _f:
+            v = _f.read().strip().lower()
+        if v in ("half", "full"):
+            return v
+    except OSError:
+        pass
+    return "full"
+
+
+PUNCT_STYLE = _punct_style()
+
 # 语料 id：只用来在台账里打戳（排查串库），不参与任何路径计算。
 CORPUS_ID = os.environ.get("DSH_CORPUS_ID") or ""
 PATCHES = os.path.abspath(
